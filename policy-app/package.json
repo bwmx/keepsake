@@ -1,0 +1,28 @@
+{
+  "name": "algorand-ephemeral-capsule-policy-app",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build:contract": "algokit compile ts smart_contracts --out-dir artifacts && algokit generate client smart_contracts/artifacts --output {app_spec_dir}/{contract_name}Client.ts",
+    "build": "npm --prefix ../crypto-spike run build && npm run build:contract && tsc -p tsconfig.json",
+    "test": "npm run build && node --test --test-concurrency=1 dist/test/*.test.js",
+    "demo": "npm run build && node dist/demo/server.js"
+  },
+  "dependencies": {
+    "@algorandfoundation/algorand-typescript": "1.3.1",
+    "@bwmx/algorand-vrf-utils-ts": "git+https://github.com/bwmx/algorand-vrf-utils-ts.git#92c8b60617feb17f5327f17d47020595eb025818"
+  },
+  "devDependencies": {
+    "@algorandfoundation/algokit-client-generator": "6.0.1",
+    "@algorandfoundation/algokit-utils": "9.2.2",
+    "@algorandfoundation/puya-ts": "1.3.1",
+    "@types/node": "24.19.1",
+    "algorand-ephemeral-capsule-crypto-spike": "file:../crypto-spike",
+    "algosdk": "3.8.0",
+    "typescript": "5.9.3"
+  }
+}
