@@ -14,7 +14,7 @@ This package contains the Algorand side of [the implementation plan](../IMPLEMEN
 | `src/worker.ts` | Member worker (nominator + holder). Talks only to algod; no network API; also runs as a CLI |
 | `src/sim.ts` | LocalNet environment: beacon + daemon, app, enrolled members, in-process workers, sender/recipient flows |
 | `demo/` | **Capsule Lab**: a local web UI that drives all of the above |
-| `smart_contracts/epoch_committee/`, `src/epochs.ts` | `EpochCommittee`: Phase 1 of `../PAPER_ALIGNMENT_PLAN.md`, the paper's epoch committees (see below). Not yet driven by workers or used by capsules |
+| `smart_contracts/epoch_committee/`, `src/epochs.ts`, `src/epoch-worker.ts` | `EpochCommittee` and its member worker: Phases 1–3 of `../PAPER_ALIGNMENT_PLAN.md`, the paper's epoch committees holding bucket keys (see below). Not yet used by capsules |
 | `smart_contracts/broadcast_probe/`, `bench/broadcast-probe.ts` | Phase 0 probe for `../PAPER_ALIGNMENT_PLAN.md`: argument and note limits and fees, an epoch of handover data posted and rebuilt from blocks, block-seed lookback, stake opcodes (`npm run probe`) |
 
 It runs on **LocalNet only** and is not deployed elsewhere. All cryptography stays in the [crypto spike](../crypto-spike/README.md).
@@ -30,7 +30,7 @@ git submodule update --init randomness-beacon
 (cd crypto-spike && npm ci --ignore-scripts)
 cd policy-app && npm exec --yes --package=pnpm@12.6.0 -- npm ci
 algokit localnet start
-npm test        # 11 LocalNet tests, about 70 s
+npm test        # 12 LocalNet tests, about 5 minutes
 npm run demo    # Capsule Lab at http://127.0.0.1:8787
 ```
 
@@ -103,16 +103,30 @@ Worker config is read from the environment:
 
 Each worker writes JSON event lines to stdout: `ready`, `nominated`, `custody`, `released`, `disposed`, `erased` (an epoch's nomination key). These name the member's own slots and stay private to its operator.
 
-## Epoch committees (paper alignment, Phases 1–2)
+## Epoch committees (paper alignment, Phases 1–3)
 
-`EpochCommittee` is a separate app for the paper's evolving committees (eprint 2020/464 §3). It's tested on LocalNet but not yet driven by workers (Phase 3) or used by capsules (Phase 4). Epoch e spans rounds `[e·E, (e+1)·E)`. Committee c is nominated in epoch c − 1 from the block seed of that epoch's first round, and hands over in epoch c.
+`EpochCommittee` is a separate app for the paper's evolving committees (eprint 2020/464 §3). Its workers run it on LocalNet; capsules don't use it yet (Phase 4). Epoch e spans rounds `[e·E, (e+1)·E)`. Committee c is nominated in epoch c − 1 from the block seed of that epoch's first round, and hands over in epoch c.
 
 | Rounds of epoch e | Call | Who | Checks |
 | --- | --- | --- | --- |
 | Any | `admitMember`; `enroll(vrfKey)` once; `postNominationKey(epoch, key)` for the current or next epoch, never replaced | Admin; member | `Txn.sender` |
 | 1…`nominationRounds` | `captureSeed(e + 1)` (also done by the first nomination); `nominate(index, proof, epk, sigKey, sealedSeed)`, once per member, for committee e + 1 | Anyone; eligible member | The seed is read with `block BlkSeed` under a short validity window. `vrf_verify` over `sha256("ecpss/nominate/v1" ‖ appId ‖ committee ‖ seed)` with the enrolled key, rank below the threshold, member enrolled before the seed round |
 | Next `handoverRounds` | `claim(e, nominator, holder, sig)`, then `postChunk(e, nominator, a, b, c, d)` with the note, then `finalize` | Committee e's holders | The seat's one-time Ed25519 key signs the claim; after that, `Txn.sender` must be the claimed holder. Each chunk is folded into the seat's on-chain running digest |
-| After epoch e | `deleteSeats(e, nominators[])` (batches of 7), then `deleteCommittee(e)` | Anyone | — |
+| After epoch e | `deleteSeats(e, nominators[])` (batches of 7), then `deleteCommittee(e)` | Anyone (workers take turns, three committees back) | — |
+
+`createApplication` also fixes the parameters every member must agree on:
+- the sharing threshold t;
+- the bucket schedule: bucket b covers rounds `[b·bucketRounds, (b+1)·bucketRounds)` and is created `bucketLead` rounds early;
+- the genesis committee, which holds nothing and creates the first buckets.
+
+The member worker ([`src/epoch-worker.ts`](src/epoch-worker.ts)) handles each epoch:
+- **Keys.** It posts its nomination keys.
+- **Nomination.** It nominates if eligible, sealing a fresh seat to a uniformly chosen member.
+- **Seats.** It opens its seats when nominations close, then erases that epoch's key.
+- **Handover.** As a holder, it builds its single handover message, erases its shares, claims the seat and posts the message from its own account. There is no relayer.
+- **Processing.** It processes every closed handover in order and catches up after an outage. Messages are verified on a shared thread pool (`VerifyPool` from the crypto spike), and it combines shares for its seats in the next committee.
+
+Secrets live only in memory. A restarted member would need to replay every handover since genesis from an archival node, which is not implemented.
 
 Off-chain, [`src/epochs.ts`](src/epochs.ts):
 - orders seats by their one-time signing key and drops any seat whose keys repeat another's;
@@ -134,6 +148,13 @@ The cryptography lives in [`crypto-spike/src/ecpss.ts`](../crypto-spike/src/ecps
 - **Step 5 end to end:** 24 members, 16 slots, and an eligibility rate that can leave slots empty. Every slot goes to its lowest-ranked eligible member, and a slot is empty exactly when nobody was eligible. Activation works. Holders are taken offline down to the threshold and recovery still works from chain releases. The indexer shows members sent only `enroll`, `postNominationKey` and `nominate`, and every custody call came from the relayer. A restarted member cannot reopen its slots. Online holders erase the capsule's epoch key while still holding custody. Workers dispose at expiry.
 - **Tampered anchor:** holders refuse custody and the capsule never activates.
 - **Fail-closed reader and CLI:** the chain reader fails closed, and the worker CLI starts only with matching enrolled keys.
+
+`test/epoch-workers.test.ts` (1 test, Phase 3, about 3 minutes): ten member workers, driven in lockstep, run 22 handovers with four outages.
+- **Agreement:** every member, including the ones that were offline, processes every handover, and all agree on each bucket's public key.
+- **No losses:** no bucket is lost, and a bucket's key and reconstructed secret never change.
+- **Schedule:** buckets appear and disappear exactly as scheduled.
+- **Indexer:** each seat's claim and finalize happen once, from its own holder (a member, never a relayer), after that member posted its key for the next epoch. Nobody speaks while offline.
+- **Cleanup:** old committees are deleted, and workers report no errors.
 
 `test/epochs.test.ts` (3 tests, Phases 1–2):
 - **Sortition:** the captured seed equals the block's seed. Exactly the VRF-eligible members nominate, once each. Ineligible, late-enrolled, copied-proof, duplicate and out-of-window nominations are rejected. Seats are numbered in signing-key order and each opens only for its nominee.

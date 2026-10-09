@@ -1,6 +1,6 @@
 # Paper alignment plan
 
-Drafted 2026-10-09; Phases 0–2 done the same day. This is a design proposal; no cryptographer has reviewed it yet, and none of it is implemented except where marked done. It aims to move the demo from one hidden committee per capsule to the paper's evolving-committee proactive secret sharing (ECPSS, [eprint 2020/464](https://eprint.iacr.org/2020/464) §3) on Algorand. The stack stays the same: Puya TS contract, TypeScript off-chain. Section numbers (§) refer to the paper.
+Drafted 2026-10-09; Phases 0–3 done the same day. This is a design proposal; no cryptographer has reviewed it yet, and none of it is implemented except where marked done. It aims to move the demo from one hidden committee per capsule to the paper's evolving-committee proactive secret sharing (ECPSS, [eprint 2020/464](https://eprint.iacr.org/2020/464) §3) on Algorand. The stack stays the same: Puya TS contract, TypeScript off-chain. Section numbers (§) refer to the paper.
 
 ## Where we are
 
@@ -165,6 +165,46 @@ Proofs of knowledge for new keys are bound to the committee, bucket and dealer.
 
 **Cost of the cheating case: not improved.** Reusing each epoch key's pairing precomputation changed nothing measurable (37.2 s honest and 138.8 s with one cheater at C = 200, against 38.0 s and 139.2 s with it), so it was removed. The real cost is the two G2 multi-scalar multiplications over C² points per batch, which the bisection repeats. Spreading work across cores is the remaining lever and moves to Phase 3. Moving shares to G1 is estimated at about 10% and is not worth doing.
 
+## Phase 3 results (done 2026-10-09)
+
+**It meets the "done when" list on LocalNet.** The pieces are:
+- `policy-app/src/epoch-worker.ts`;
+- schedule parameters added to `EpochCommittee`: the threshold t, the bucket width and lead, and the genesis committee;
+- `crypto-spike/src/parallel.ts`.
+
+`test/epoch-workers.test.ts` drives 10 member workers in lockstep through 22 handovers, with four outages of one or two members for one or two epochs each. It has passed twice in a row and takes about 3 minutes. It shows that:
+- every member, including the ones that were offline, processes every handover;
+- no bucket is lost, and all members agree on each bucket's public key;
+- a bucket's key and reconstructed secret never change while it lives;
+- buckets appear and disappear exactly as scheduled;
+- per the indexer, each seat's claim and finalize happen once, from the seat's own holder, after that member posted its key for the next epoch;
+- every speaker is a member account, so there is no relayer, and nobody speaks while offline;
+- old committees are deleted, and workers report no errors.
+
+**Each epoch, a worker:**
+1. posts its keys;
+2. nominates if eligible;
+3. opens its seats when nominations close, then erases that epoch's key;
+4. as a holder, waits until its next-epoch key is posted, then builds its message, erases its shares, claims the seat and posts from its own account;
+5. after each handover window, processes the handover: it decodes and verifies on the thread pool and combines shares for its seats in the next committee. It catches up in order after an outage.
+
+**What the test found, now fixed:**
+- **Stale seat records.** Processing reused the seat list from before anyone posted, so every message looked missing.
+- **Old committees exhausted the app's balance.** A committee leaves about 1.2 Algo of boxes, and nominations failed after about 15 committees. Members now take turns deleting the committee three back. The trade-off: a member offline for more than about two epochs can no longer rebuild the messages it missed.
+- **Silent failures.** The worker swallowed errors and never retried. It now reports errors as events and retries a failed nomination within its window.
+
+**Cost: decoding dominates, which Phase 0 missed.**
+- Every received point needs a subgroup check: about 0.63 s per dealing at C = 200, or about 126 s per bucket per epoch on one thread, against 37 s for the batched checks.
+- Batching subgroup checks is not sound, because a small-order component vanishes under a random coefficient with probability 1/ℓ. Uncompressed points save only about 25% of the decode time and double the data.
+- So `VerifyPool` decodes and checks groups of dealers on every core. On this Apple M5 (4 performance and 6 efficiency cores) decode plus verify takes 5.4 / 15.9 / 40.7 s at C = 64 / 120 / 200, about 4 times faster than one thread. The efficiency cores add little.
+- Every batch repeats about C pairings, so one task per thread beats smaller tasks. Scaling on servers with uniform cores is not measured.
+- Revised budget: at C = 200, each member spends about 40 s of a 10-core laptop per live bucket per epoch. Epochs therefore need to be several minutes long or more, depending on how many buckets are live.
+
+**Departures:**
+- Release partials are not in the message yet; that is Phase 4.
+- An outage here means a member keeps its memory. A restarted member would have to replay every handover since genesis from an archival node, which is not implemented.
+- Tests step the workers once per round; real workers poll.
+
 ## Crypto sketch for D2 (review before implementing)
 
 This works in BLS12-381 with generators g1 ∈ G1 and g2 ∈ G2 and pairing e. The secret is the group element S = s·g2. The public key is P = s·g1.
@@ -221,7 +261,7 @@ Precedents: pairing-based PVSS in SCRAPE (Cascudo and David, 2017), and group-el
   - a dropped bucket can't be recovered from the next committee's state;
   - a replayed U under another policy is refused.
 
-**Phase 3: workers run epochs on LocalNet. Size: large. Also: spread verification across cores (see Phase 1 and 2 results).**
+**Phase 3: workers run epochs on LocalNet. Done 2026-10-09; see Phase 3 results.**
 - Each epoch, the worker:
   1. nominates if eligible;
   2. opens its seats after nominations close;
@@ -254,15 +294,15 @@ Precedents: pairing-based PVSS in SCRAPE (Cascudo and David, 2017), and group-el
 
 | Gap | Closed by |
 | --- | --- |
-| No handover (static adversary over a capsule's life) | Phases 2–3 |
-| Fixed slots, one winner each | Phase 1 |
+| No handover (static adversary over a capsule's life) | Phases 2–3 (done) |
+| Fixed slots, one winner each | Phase 1 (done) |
 | Committee size and threshold | Phase 0 parameters; Phases 1 and 3 |
-| No verifiable re-sharing (§2.5, §2.6) | Phase 2, with RIND-SO still open |
+| No verifiable re-sharing (§2.5, §2.6) | Phase 2 (done), with RIND-SO still open |
 | One committee per capsule; honest dealer per capsule | Phases 1, 2 and 4 (bucket DKG) |
 | Stake weighting | Phase 5 |
-| Single-operator beacon | Phase 1 (block seed) |
+| Single-operator beacon | Phase 1 (block seed; done) |
 | Best-effort erasure | Phase 6 (better, not provable) |
-| Relayer for custody traffic | Phase 3 (speak once from own account) |
+| Relayer for custody traffic | Phase 3 (speak once from own account; done) |
 
 ## Open questions for review
 

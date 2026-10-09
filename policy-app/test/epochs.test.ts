@@ -1,63 +1,17 @@
 import assert from 'node:assert/strict';
 import { randomBytes, randomInt } from 'node:crypto';
 import { test } from 'node:test';
-import { AlgorandClient, Config, algo, microAlgo } from '@algorandfoundation/algokit-utils';
-import { nullLogger } from '@algorandfoundation/algokit-utils/types/logging';
+import { algo } from '@algorandfoundation/algokit-utils';
 import vrf from '@bwmx/algorand-vrf-utils-ts';
-import { generateEphemeralKey, open, seal, type EphemeralKeyPair } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/crypto.js';
+import { generateEphemeralKey, open, seal } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/crypto.js';
 import {
   dealerGenesis, decodeMessage, encodeMessage, handover, receive, reconstruct, seatKeys, type Message,
 } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/ecpss.js';
 import { decodeG2 } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/pvss.js';
 import { EpochCommitteeFactory } from '../smart_contracts/artifacts/epoch_committee/EpochCommitteeClient.js';
 import { b64url, vrfRank } from '../src/chain.js';
-import { EpochReader, claimMessage, nominationAlpha, postMessage, seatSeedContext, windows, type OrderedSeat } from '../src/epochs.js';
-
-Config.configure({ logger: nullLogger });
-const algorand = AlgorandClient.defaultLocalNet();
-const algod = algorand.client.algod;
-const rejects = (p: Promise<unknown>, message: string) => assert.rejects(p, new RegExp(message));
-const lastRound = async () => (await algod.status().do()).lastRound;
-const cover = { coverAppCallInnerTransactionFees: true, maxFee: microAlgo(20_000) } as const;
-/** A 10-round validity window from the next round, so `block` can still read the seed (cached params may be stale). */
-const shortWindow = async () => ({ firstValidRound: (await lastRound()) + 1n, validityWindow: 10 });
-
-type Env = Awaited<ReturnType<typeof deploy>>;
-type Member = Env['members'][number];
-
-async function deploy(o: { members: number; epochRounds: bigint; nominationRounds: bigint; handoverRounds: bigint; threshold: bigint }) {
-  await vrf.init();
-  const dispenser = await algorand.account.localNetDispenser();
-  const fund = async (amount = 20) => { const a = algorand.account.random(); await algorand.account.ensureFunded(a, dispenser, algo(amount)); return a; };
-  const [admin, ticker] = [await fund(50), await fund()];
-  const { appClient: app } = await algorand.client.getTypedAppFactory(EpochCommitteeFactory, { defaultSender: admin.addr }).send.create
-    .createApplication({ args: { epochRounds: o.epochRounds, nominationRounds: o.nominationRounds, handoverRounds: o.handoverRounds, nominatorThreshold: o.threshold } });
-  await algorand.send.payment({ sender: admin, receiver: app.appAddress, amount: algo(20) });
-  const { genesisHash } = await algorand.client.network();
-  const pins = { genesisHash, appId: app.appId, beaconAppId: 0n, maxRoundAgeMs: 0 };
-  const params = { epochRounds: o.epochRounds, nominationRounds: o.nominationRounds, handoverRounds: o.handoverRounds };
-  const reader = new EpochReader(algod, pins, params, app.appClient.getABIMethod('postChunk').getSelector());
-  const addMember = async (index: number) => {
-    const account = await fund(), vrfSecretKey = vrf.generateKeyPair().secretKey;
-    await app.send.admitMember({ args: { account: account.toString() } });
-    await app.send.enroll({ sender: account, args: { vrfKey: vrfSecretKey.subarray(32) } });
-    return { index: BigInt(index), account, vrfSecretKey, keys: new Map<bigint, EphemeralKeyPair>() };
-  };
-  const members = [];
-  for (let i = 0; i < o.members; i++) members.push(await addMember(i));
-  /** Advances so that the next transaction executes in `round`. */
-  const nextRoundIs = async (round: bigint) => {
-    while ((await lastRound()) + 1n < round) await algorand.send.payment({ sender: ticker, receiver: ticker, amount: microAlgo(0), note: randomBytes(8) });
-    assert.equal((await lastRound()) + 1n, round, 'Target round already passed');
-  };
-  /** Moves to the start of a fresh epoch and returns the next one, whose keys members can now post in good time. */
-  const nextEpoch = async () => {
-    const current = (await lastRound()) / o.epochRounds + 1n;
-    await nextRoundIs(current * o.epochRounds + 1n);
-    return current + 1n;
-  };
-  return { app, admin, members, pins, params, reader, addMember, nextRoundIs, nextEpoch };
-}
+import { claimMessage, nominationAlpha, postMessage, seatSeedContext, windows, type OrderedSeat } from '../src/epochs.js';
+import { algod, algorand, cover, deploy, lastRound, rejects, shortWindow, type Env, type Member } from './epoch-env.js';
 
 /** Each member posts a fresh nomination key for `epoch` and keeps the private half (the worker's job in Phase 3). */
 async function postKeys(env: Env, epoch: bigint) {
@@ -179,8 +133,10 @@ test('handover on chain: holders claim seats and post one message each; readers 
   // Committee c2 rebuilds every message from blocks (checked against the on-chain digests), drops what fails to
   // decode or verify, and combines the first t valid dealings per bucket.
   const messages = new Map<number, Message>();
+  const read = await env.reader.messages(c1, await env.reader.seats(c1));
+  assert.equal(read.size, seats1.length);
   for (const s of await env.reader.seats(c1)) {
-    const bytes = await env.reader.message(c1, s.nominator, s.value);
+    const bytes = read.get(s.seat)!;
     assert.deepEqual(bytes, posted.get(s.seat));
     try { messages.set(s.seat, decodeMessage(bytes, s.seat, seats2.length, t)); } catch { assert.equal(s.seat, cheater.seat); }
   }
@@ -212,10 +168,14 @@ test('parameters are checked at creation, and the app cannot be updated, deleted
   const admin = algorand.account.random();
   await algorand.account.ensureFunded(admin, await algorand.account.localNetDispenser(), algo(10));
   const factory = algorand.client.getTypedAppFactory(EpochCommitteeFactory, { defaultSender: admin.addr });
-  const create = (epochRounds: bigint, nominationRounds: bigint, handoverRounds: bigint) =>
-    factory.send.create.createApplication({ args: { epochRounds, nominationRounds, handoverRounds, nominatorThreshold: 1n } });
+  const genesis = (await lastRound()) / 60n + 3n;
+  const create = (epochRounds: bigint, nominationRounds: bigint, handoverRounds: bigint, o: { bucketRounds?: bigint; genesisCommittee?: bigint } = {}) =>
+    factory.send.create.createApplication({ args: { epochRounds, nominationRounds, handoverRounds, nominatorThreshold: 1n, shareThreshold: 3n,
+      bucketRounds: o.bucketRounds ?? 120n, bucketLead: 60n, genesisCommittee: o.genesisCommittee ?? genesis } });
   await rejects(create(60n, 30n, 30n), 'Epoch too short');
-  await rejects(create(5000n, 991n, 30n), 'Nomination window too long');
+  await rejects(create(5000n, 991n, 30n, { bucketRounds: 5000n, genesisCommittee: (await lastRound()) / 5000n + 3n }), 'Nomination window too long');
+  await rejects(create(60n, 20n, 20n, { bucketRounds: 59n }), 'Invalid schedule'); // A bucket spans at least an epoch.
+  await rejects(create(60n, 20n, 20n, { genesisCommittee: genesis - 2n }), 'Invalid schedule'); // Its nominations already began.
   const { appClient } = await create(60n, 20n, 20n);
   const program = '#pragma version 11\npushint 1\nreturn';
   const refused = 'logic eval error|rejected by ApprovalProgram';

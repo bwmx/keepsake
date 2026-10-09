@@ -40,6 +40,13 @@ export class EpochCommittee extends Contract {
   nominationRounds = GlobalState<uint64>({ key: 'nominationRounds' }) // Rounds 1..this of each epoch.
   handoverRounds = GlobalState<uint64>({ key: 'handoverRounds' }) // The rounds right after nominations.
   nominatorThreshold = GlobalState<uint64>({ key: 'nominatorThreshold' }) // Eligible iff VRF rank < this.
+  // Agreed by every member, used off-chain: the sharing threshold t, the bucket schedule (bucket b covers rounds
+  // [b·bucketRounds, (b+1)·bucketRounds) and is created bucketLead rounds early), and the first committee, which holds
+  // nothing and creates the first buckets.
+  shareThreshold = GlobalState<uint64>({ key: 'shareThreshold' })
+  bucketRounds = GlobalState<uint64>({ key: 'bucketRounds' })
+  bucketLead = GlobalState<uint64>({ key: 'bucketLead' })
+  genesisCommittee = GlobalState<uint64>({ key: 'genesisCommittee' })
   registrySize = GlobalState<uint64>({ key: 'registrySize', initialValue: 0 })
   registry = BoxMap<uint64, Member>({ keyPrefix: 'm' })
   admitted = BoxMap<Account, uint64>({ keyPrefix: 'a' }) // 0 = admitted, n = enrolled at index n − 1.
@@ -48,8 +55,12 @@ export class EpochCommittee extends Contract {
   seats = BoxMap<bytes, Seat>({ keyPrefix: 'n' }) // Key: itob(committee) || itob(nominator index).
 
   @abimethod({ onCreate: 'require' })
-  createApplication(epochRounds: uint64, nominationRounds: uint64, handoverRounds: uint64, nominatorThreshold: uint64): void {
-    assert(nominationRounds > 0 && handoverRounds > 0 && nominatorThreshold > 0, 'Invalid parameters')
+  createApplication(
+    epochRounds: uint64, nominationRounds: uint64, handoverRounds: uint64, nominatorThreshold: uint64, shareThreshold: uint64,
+    bucketRounds: uint64, bucketLead: uint64, genesisCommittee: uint64,
+  ): void {
+    assert(nominationRounds > 0 && handoverRounds > 0 && nominatorThreshold > 0 && shareThreshold > 0, 'Invalid parameters')
+    assert(bucketRounds >= epochRounds && genesisCommittee > Global.round / epochRounds + 1, 'Invalid schedule')
     assert(nominationRounds <= SEED_LOOKBACK, 'Nomination window too long')
     // Both windows fit in one epoch, so a ring entry is overwritten only after its epoch's nominations end.
     assert(nominationRounds + handoverRounds < epochRounds, 'Epoch too short')
@@ -58,6 +69,10 @@ export class EpochCommittee extends Contract {
     this.nominationRounds.value = nominationRounds
     this.handoverRounds.value = handoverRounds
     this.nominatorThreshold.value = nominatorThreshold
+    this.shareThreshold.value = shareThreshold
+    this.bucketRounds.value = bucketRounds
+    this.bucketLead.value = bucketLead
+    this.genesisCommittee.value = genesisCommittee
   }
 
   // The admin funds registry, key, committee and seat boxes by pre-funding the app account.

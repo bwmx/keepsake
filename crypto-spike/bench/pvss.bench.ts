@@ -2,9 +2,11 @@ import assert from 'node:assert/strict';
 import os from 'node:os';
 import { bls12_381 as bls } from '@noble/curves/bls12-381.js';
 import {
-  aggregate, combine, combinePartials, deal, dealingSize, encapsulate, evaluate, lagrange, partial, point, randomScalar,
+  aggregate, combine, combinePartials, deal, dealingSize, decodeDealing, encapsulate, encodeDealing, evaluate, lagrange, partial, point, randomScalar,
   seatCommitment, validDealings, verifyPartial, type Dealing, type G1Point,
 } from '../src/pvss.js';
+import { encodeMessage } from '../src/ecpss.js';
+import { VerifyPool, receiveParallel } from '../src/parallel.js';
 
 // Phase 0: one member's work per epoch for the pairing re-sharing prototype, single-threaded.
 const time = <T>(f: () => T): [T, number] => { const s = performance.now(); return [f(), performance.now() - s]; };
@@ -23,6 +25,7 @@ function fastDeal(dealer: number, sigma: bigint, commitment: G1Point, next: bigi
 }
 
 const rows = [];
+const pool = new VerifyPool();
 for (const [C, t] of [[64, 16], [120, 44], [200, 72]] as const) {
   const F = Array.from({ length: t }, () => randomScalar());
   const sigma = Array.from({ length: C }, (_, j) => evaluate(F, BigInt(j + 1)));
@@ -38,6 +41,15 @@ for (const [C, t] of [[64, 16], [120, 44], [200, 72]] as const) {
   const [kept, verifyBadMs] = time(() => validDealings(bad, epks, t, { prior }));
   assert.equal(kept.length, C - 1);
 
+  // From the wire: every point is decoded with a subgroup check, then verified, on all cores.
+  const raw = new Map(dealings.map(d => [d.dealer, encodeMessage({ reshares: new Map([[1n, d]]), contributions: new Map() })]));
+  const [, decodeOneMs] = time(() => decodeDealing(encodeDealing(first), 1, C, t, false));
+  const pub = new Map([[1n, [point.g1(F[0]!), ...F.slice(1).map(point.g1)]]]);
+  const parallelStart = performance.now();
+  const received = await receiveParallel(pool, raw, pub, 1n, { live: [1n], create: [] }, epks, t, [{ seat: 1, x: next[0]! }]);
+  const parallelMs = performance.now() - parallelStart;
+  assert.deepEqual(received.lost, []);
+
   const chosen = valid.slice(0, t), weights = lagrange(chosen.map(d => d.dealer));
   const [held, combineMs] = time(() => ({ share: combine(1, next[0]!, chosen, weights), commitment: seatCommitment(aggregate(chosen, weights), 1) }));
   assert.ok(bls.fields.Fp12.eql(bls.pairing(point.g1(1n), held.share), bls.pairing(held.commitment, point.g2(1n))));
@@ -50,14 +62,15 @@ for (const [C, t] of [[64, 16], [120, 44], [200, 72]] as const) {
   const [, combinePartialsMs] = time(() => combinePartials(Array.from({ length: t }, (_, i) => ({ seat: i + 1, d: part.d }))));
 
   const bytes = dealingSize(C, t, false);
-  rows.push({ C, t, dealMs, verifyMs, verifyBadMs, combineMs, partialMs, verifyPartialMs, combinePartialsMs, dealingKB: bytes / 1024, epochMB: (C * bytes) / 2 ** 20 });
+  rows.push({ C, t, dealMs, decodeOneMs, parallelMs, verifyMs, verifyBadMs, combineMs, partialMs, verifyPartialMs, combinePartialsMs, dealingKB: bytes / 1024, epochMB: (C * bytes) / 2 ** 20 });
   console.error(`C = ${C} done`);
 }
 
 const s = (ms: number) => (ms / 1000).toFixed(ms < 1000 ? 2 : 1);
-console.log(`Node ${process.version}, ${os.cpus()[0]?.model}, single-threaded. Times in seconds.\n`);
-console.log('| C | t | Deal (one member) | Verify all C dealings | Same, one cheater | Combine own share | Partial + proof | Verify partial | Recipient combine (t) | Dealing size | Epoch data |');
-console.log('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
+await pool.close();
+console.log(`Node ${process.version}, ${os.cpus()[0]?.model}. Times in seconds, single-threaded except the pool column (${pool.size} threads).\n`);
+console.log('| C | t | Deal (one member) | Decode one dealing | Decode + verify all, pool | Verify all C dealings (decoded) | Same, one cheater | Combine own share | Partial + proof | Verify partial | Recipient combine (t) | Dealing size | Epoch data |');
+console.log('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
 for (const r of rows) {
-  console.log(`| ${r.C} | ${r.t} | ${s(r.dealMs)} | ${s(r.verifyMs)} | ${s(r.verifyBadMs)} | ${s(r.combineMs)} | ${s(r.partialMs)} | ${s(r.verifyPartialMs)} | ${s(r.combinePartialsMs)} | ${r.dealingKB.toFixed(1)} KB | ${r.epochMB.toFixed(2)} MiB |`);
+  console.log(`| ${r.C} | ${r.t} | ${s(r.dealMs)} | ${s(r.decodeOneMs)} | ${s(r.parallelMs)} | ${s(r.verifyMs)} | ${s(r.verifyBadMs)} | ${s(r.combineMs)} | ${s(r.partialMs)} | ${s(r.verifyPartialMs)} | ${s(r.combinePartialsMs)} | ${r.dealingKB.toFixed(1)} KB | ${r.epochMB.toFixed(2)} MiB |`);
 }

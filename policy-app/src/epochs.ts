@@ -12,7 +12,10 @@ import { ChainReader, hex, type ChainPins } from './chain.js';
  * formats, seat ordering, and handover messages posted as chunks and rebuilt from block data.
  */
 export type { Committee, Seat };
-export interface EpochParams { epochRounds: bigint; nominationRounds: bigint; handoverRounds: bigint }
+export interface EpochParams {
+  epochRounds: bigint; nominationRounds: bigint; handoverRounds: bigint;
+  shareThreshold: bigint; bucketRounds: bigint; bucketLead: bigint; genesisCommittee: bigint;
+}
 
 const u64 = (n: bigint) => Buffer.from(encodeUint64(n));
 const sha = (...parts: Uint8Array[]) => { const h = createHash('sha256'); for (const p of parts) h.update(p); return h.digest(); };
@@ -25,6 +28,26 @@ export const windows = (p: EpochParams, epoch: bigint) => {
   return { seedRound: start, nominate: [start + 1n, start + p.nominationRounds] as const,
     handover: [start + p.nominationRounds + 1n, start + p.nominationRounds + p.handoverRounds] as const };
 };
+
+/**
+ * Buckets committee k must hold: those whose window [b·W, (b+1)·W) has not ended when epoch k starts and that start
+ * before epoch k + 1 ends plus the lead, so senders can encrypt to a bucket before its window opens.
+ */
+export function bucketsNeeded(p: EpochParams, k: bigint): bigint[] {
+  const first = (k * p.epochRounds) / p.bucketRounds, last = ((k + 1n) * p.epochRounds + p.bucketLead - 1n) / p.bucketRounds;
+  return Array.from({ length: Number(last - first + 1n) }, (_, i) => first + BigInt(i));
+}
+
+/**
+ * What committee c's handover carries: buckets still needed are re-shared, newly needed ones created, and the rest
+ * dropped, never re-dealt. The genesis committee holds nothing and creates. A lost bucket is never recreated.
+ */
+export function handoverBuckets(p: EpochParams, c: bigint) {
+  const next = bucketsNeeded(p, c + 1n);
+  if (c === p.genesisCommittee) return { live: [], create: next };
+  const now = new Set(bucketsNeeded(p, c));
+  return { live: next.filter(b => now.has(b)), create: next.filter(b => !now.has(b)) };
+}
 
 /** VRF input for a member's sortition for committee c; must match `nominate`. */
 export const nominationAlpha = (appId: bigint, committee: bigint, seed: Uint8Array) =>
@@ -88,11 +111,8 @@ export class EpochReader extends ChainReader {
    * a nominator copying an honest seat's keys can only spend its own nomination to cancel that seat.
    */
   async seats(committee: bigint): Promise<OrderedSeat[]> {
-    await this.lastRound();
-    const prefix = Buffer.concat([Buffer.from('n'), u64(committee)]);
-    const { boxes } = await this.algod.getApplicationBoxes(this.pins.appId).do();
-    const all = await Promise.all(boxes.map(b => Buffer.from(b.name)).filter(n => n.length === 17 && n.subarray(0, 9).equals(prefix))
-      .map(async name => ({ nominator: name.readBigUInt64BE(9), value: SeatFromTuple(SEAT.decode((await this.box(name)).value) as never) })));
+    const all = await Promise.all((await this.nominators(committee)).map(async nominator =>
+      ({ nominator, value: SeatFromTuple(SEAT.decode((await this.box(Buffer.from('n'), u64(committee), u64(nominator))).value) as never) })));
     const keys = all.flatMap(s => [hex(s.value.sigKey), hex(s.value.epk)]);
     const unique = (k: Uint8Array) => keys.indexOf(hex(k)) === keys.lastIndexOf(hex(k));
     return all.filter(s => unique(s.value.sigKey) && unique(s.value.epk))
@@ -100,27 +120,41 @@ export class EpochReader extends ChainReader {
       .map((s, i) => ({ seat: i + 1, ...s }));
   }
 
+  /** Every nominator with a seat box in committee c, including seats dropped from the ordering (for deletion). */
+  async nominators(committee: bigint): Promise<bigint[]> {
+    await this.lastRound();
+    const prefix = Buffer.concat([Buffer.from('n'), u64(committee)]);
+    const { boxes } = await this.algod.getApplicationBoxes(this.pins.appId).do();
+    return boxes.map(b => Buffer.from(b.name)).filter(n => n.length === 17 && n.subarray(0, 9).equals(prefix)).map(n => n.readBigUInt64BE(9));
+  }
+
   /**
-   * A finalized seat's message, rebuilt from the blocks of committee c's handover window through algod alone, and
-   * checked against the seat's on-chain running digest. Non-archival nodes keep only recent blocks, so read promptly.
+   * Committee c's finalized messages, rebuilt from the blocks of its handover window through algod alone (one scan
+   * for all seats) and checked against each seat's on-chain running digest. Seats whose message does not match are
+   * left out. Non-archival nodes keep only recent blocks, so read promptly.
    */
-  async message(committee: bigint, nominator: bigint, seat: Seat): Promise<Buffer> {
+  async messages(committee: bigint, seats: OrderedSeat[]): Promise<Map<number, Buffer>> {
     const [from, to] = windows(this.params, committee).handover;
     const last = await this.lastRound();
-    let digest: Buffer = Buffer.alloc(32);
-    const pieces: Buffer[] = [];
+    const log = new Map<bigint, { digest: Buffer; pieces: Buffer[] }>();
     for (let r = from; r <= (to < last ? to : last); r++) {
       for (const s of (await this.algod.block(r).do()).block.payset) {
         const txn = s.signedTxn.signedTxn.txn, call = txn.applicationCall;
         if (call?.appIndex !== this.pins.appId || call.appArgs.length !== 7) continue;
         const [selector, c, n, ...parts] = call.appArgs.map(a => Buffer.from(a));
-        if (!selector!.equals(Buffer.from(this.postChunkSelector)) || c!.readBigUInt64BE(0) !== committee || n!.readBigUInt64BE(0) !== nominator) continue;
+        if (!selector!.equals(Buffer.from(this.postChunkSelector)) || c!.readBigUInt64BE(0) !== committee) continue;
         const data = parts.map(p => p.subarray(2)); // byte[] arguments carry a 2-byte length prefix.
-        digest = sha(digest, ...data.map(p => sha(p)), sha(txn.note));
-        pieces.push(...data, Buffer.from(txn.note));
+        const entry = log.get(n!.readBigUInt64BE(0)) ?? { digest: Buffer.alloc(32), pieces: [] };
+        entry.digest = sha(entry.digest, ...data.map(p => sha(p)), sha(txn.note));
+        entry.pieces.push(...data, Buffer.from(txn.note));
+        log.set(n!.readBigUInt64BE(0), entry);
       }
     }
-    if (!seat.finalized || !digest.equals(Buffer.from(seat.digest))) throw new Error('Message incomplete or does not match the chain');
-    return Buffer.concat(pieces);
+    const out = new Map<number, Buffer>();
+    for (const s of seats) {
+      const entry = log.get(s.nominator);
+      if (s.value.finalized && entry?.digest.equals(Buffer.from(s.value.digest))) out.set(s.seat, Buffer.concat(entry.pieces));
+    }
+    return out;
   }
 }

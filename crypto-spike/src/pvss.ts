@@ -194,15 +194,24 @@ export function encodeDealing(d: Dealing): Buffer {
     ...(d.pok ? [scalarBytes(d.pok.c), scalarBytes(d.pok.z)] : [])]);
 }
 
-/** Strict decoding of untrusted bytes: exact length, canonical scalars, curve and subgroup checks, no identity points. */
-export function decodeDealing(bytes: Uint8Array, dealer: number, n: number, t: number, contribution: boolean): Dealing {
+/**
+ * Strict decoding of untrusted bytes: exact length, canonical scalars, curve and subgroup checks, no identity points.
+ * With `keep` (seats), only those subshares are decoded and the rest are left out of the sparse array: such a partial
+ * dealing serves `aggregate` and `combine` for already-verified dealings, never `validDealings`.
+ */
+export function decodeDealing(bytes: Uint8Array, dealer: number, n: number, t: number, contribution: boolean, keep?: number[]): Dealing {
   if (bytes.length !== dealingSize(n, t, contribution)) throw new Error('Bad dealing length');
   let at = 0;
   const take = (len: number) => bytes.subarray(at, (at += len));
   const p1 = () => decodeG1(take(48)), p2 = () => decodeG2(take(96));
   const scalar = () => { const x = BigInt(`0x${Buffer.from(take(SCALAR)).toString('hex')}`); if (x >= ORDER) throw new Error('Non-canonical scalar'); return x; };
   const commitments = Array.from({ length: t }, p1);
-  const subshares = Array.from({ length: n }, () => ({ r1: p1(), r2: p2(), b: p2() }));
+  const wanted = keep && new Set(keep);
+  const subshares: Subshare[] = [];
+  for (let k = 1; k <= n; k++) {
+    if (!wanted || wanted.has(k)) subshares[k - 1] = { r1: p1(), r2: p2(), b: p2() };
+    else at += 240; // Skipped: no subgroup checks for points this caller never uses.
+  }
   return { dealer, commitments, subshares, ...(contribution ? { pok: { c: scalar(), z: scalar() } } : {}) };
 }
 

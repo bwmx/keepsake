@@ -55,38 +55,56 @@ export function handover(h: Holder, pub: Public, committee: bigint, buckets: { l
   return { reshares, contributions };
 }
 
+export interface Buckets { live: bigint[]; create: bigint[] }
+const dealingsFor = (messages: Map<number, Message>, b: bigint, kind: keyof Message) => {
+  const seats = [...messages.keys()].sort((x, y) => x - y);
+  return seats.map(s => messages.get(s)![kind].get(b)).filter((d, i): d is Dealing => d?.dealer === seats[i]);
+};
+
 /**
- * Everyone's view of committee `committee`'s handover; each of `mine` (next-committee seats this caller holds; a worker
- * passes its own) also gets its new shares. For each
- * bucket the first t valid dealings in seat order are used. A live bucket with fewer than t valid re-sharings is lost;
- * an expired bucket is simply not in `live`, so nobody receives it.
+ * The costly half of receiving committee `committee`'s handover (§3.1.3): per bucket, the seats whose dealings pass, in
+ * seat order. Re-sharings are checked against the committee's commitments, new-key contributions against their proofs.
+ * Dealings are independent, so callers may check disjoint groups of seats in parallel and merge.
  */
-export function receive(messages: Map<number, Message>, pub: Public, committee: bigint, buckets: { live: bigint[]; create: bigint[] },
-  next: G2Point[], t: number, mine: { seat: number; x: bigint }[] = []) {
-  const seats = [...messages.keys()].sort((a, b) => a - b);
-  const result = { pub: new Map() as Public, lost: [] as bigint[], used: new Map<bigint, number[]>(),
-    holders: mine.map(m => ({ seat: m.seat, x: m.x, shares: new Map<bigint, G2Point>() }) as Holder) };
-  const adopt = (b: bigint, valid: Dealing[], weights: bigint[]) => {
-    result.pub.set(b, aggregate(valid, weights));
-    result.used.set(b, valid.map(d => d.dealer));
-    for (const h of result.holders) h.shares.set(b, combine(h.seat, h.x, valid, weights));
-  };
+export function validSeats(messages: Map<number, Message>, pub: Public, committee: bigint, buckets: Buckets, next: G2Point[], t: number) {
+  const valid = new Map<bigint, number[]>();
   for (const b of buckets.live) {
-    const poly = pub.get(b);
-    const dealings = seats.map(s => messages.get(s)!.reshares.get(b)).filter((d, i): d is Dealing => d?.dealer === seats[i]);
+    const poly = pub.get(b), dealings = dealingsFor(messages, b, 'reshares');
     const prior = new Map(dealings.map(d => [d.dealer, seatCommitment(poly ?? [], d.dealer)] as const));
-    const valid = poly ? validDealings(dealings, next, t, { prior }).slice(0, t) : [];
-    if (valid.length < t) result.lost.push(b);
-    else adopt(b, valid, lagrange(valid.map(d => d.dealer)));
+    valid.set(b, poly ? validDealings(dealings, next, t, { prior }).map(d => d.dealer) : []);
   }
   for (const b of buckets.create) {
-    const dealings = seats.map(s => messages.get(s)!.contributions.get(b)).filter((d, i): d is Dealing => d?.dealer === seats[i]);
-    const valid = validDealings(dealings, next, t, { context: context(committee, b) }).slice(0, t); // ≥ 1 honest among t.
-    if (valid.length < t) result.lost.push(b);
-    else adopt(b, valid, valid.map(() => 1n));
+    valid.set(b, validDealings(dealingsFor(messages, b, 'contributions'), next, t, { context: context(committee, b) }).map(d => d.dealer));
+  }
+  return valid;
+}
+
+/**
+ * The cheap half: per bucket, the first t valid dealings in seat order give the next committee's commitments and, for
+ * each of `mine` (next-committee seats this caller holds; a worker passes its own), a share. A live bucket with fewer
+ * than t valid re-sharings is lost; an expired bucket is not in `live`, so nobody receives it. `messages` may be
+ * partially decoded (commitments and the caller's subshares) once `valid` is known.
+ */
+export function adopt(messages: Map<number, Message>, valid: Map<bigint, number[]>, buckets: Buckets, t: number, mine: { seat: number; x: bigint }[] = []) {
+  const result = { pub: new Map() as Public, lost: [] as bigint[], used: new Map<bigint, number[]>(),
+    holders: mine.map(m => ({ seat: m.seat, x: m.x, shares: new Map<bigint, G2Point>() }) as Holder) };
+  for (const [kind, list] of [['reshares', buckets.live], ['contributions', buckets.create]] as const) {
+    for (const b of list) {
+      const seats = (valid.get(b) ?? []).slice(0, t); // A contribution set of t includes at least one honest dealer.
+      if (seats.length < t) { result.lost.push(b); continue; }
+      const dealings = seats.map(s => messages.get(s)![kind].get(b)!);
+      const weights = kind === 'reshares' ? lagrange(seats) : seats.map(() => 1n);
+      result.pub.set(b, aggregate(dealings, weights));
+      result.used.set(b, seats);
+      for (const h of result.holders) h.shares.set(b, combine(h.seat, h.x, dealings, weights));
+    }
   }
   return result;
 }
+
+/** Everyone's view of committee `committee`'s handover, in this thread: `validSeats` then `adopt`. */
+export const receive = (messages: Map<number, Message>, pub: Public, committee: bigint, buckets: Buckets, next: G2Point[], t: number,
+  mine: { seat: number; x: bigint }[] = []) => adopt(messages, validSeats(messages, pub, committee, buckets, next, t), buckets, t, mine);
 
 /** §3.1.1: an honest dealer plays t first-committee roles to create a bucket; it must erase the secret it returns. */
 export function dealerGenesis(bucket: bigint, next: G2Point[], t: number) {
@@ -146,8 +164,8 @@ export function encodeMessage(m: Message): Buffer {
   return Buffer.concat([head, ...entries.flatMap(([b, kind, d]) => [u64(b), Buffer.from([kind]), encodeDealing(d)])]);
 }
 
-/** Strict decoding of an untrusted message posted for `seat`; n is the next committee's size. */
-export function decodeMessage(bytes: Uint8Array, seat: number, n: number, t: number): Message {
+/** Strict decoding of an untrusted message posted for `seat`; n is the next committee's size. `keep`: see decodeDealing. */
+export function decodeMessage(bytes: Uint8Array, seat: number, n: number, t: number, keep?: number[]): Message {
   const buf = Buffer.from(bytes);
   check(buf.length >= 2, 'Truncated message');
   const m: Message = { reshares: new Map(), contributions: new Map() };
@@ -160,7 +178,7 @@ export function decodeMessage(bytes: Uint8Array, seat: number, n: number, t: num
     check(!target.has(bucket), 'Duplicate entry');
     const size = dealingSize(n, t, kind === 1);
     check(buf.length >= at + 9 + size, 'Truncated message');
-    target.set(bucket, decodeDealing(buf.subarray(at + 9, at + 9 + size), seat, n, t, kind === 1));
+    target.set(bucket, decodeDealing(buf.subarray(at + 9, at + 9 + size), seat, n, t, kind === 1, keep));
     at += 9 + size;
   }
   check(at === buf.length, 'Trailing bytes');

@@ -23,7 +23,7 @@ Working product assumption: private release to one authorized recipient during a
 | --- | --- |
 | `crypto-spike/` | Milestone 1: AES-256-GCM payload, majority-threshold Shamir (3–64 custodians; fixed demo 3-of-5), HPKE deposits/responses, Ed25519 response signatures, anchored manifest/share commitments, request binding, best-effort disposal. Its own tests and demo use the trusted in-memory ledger and fixed committee. It now also supports the `algorand-hidden-v1` committee mode, one-time holder keys derived from a seed, manifest-only custody acceptance, domain-separated chain signatures and an async `AuthorizationSource` |
 | `policy-app/` | Milestones 2–3 on LocalNet: the `CapsulePolicy` app (Algorand TypeScript/Puya TS) with hidden, variable-size holder committees (design steps 1–5). Members enroll VRF keys, post a fresh nomination key every epoch (erased once that epoch's nominations close, as the paper's per-epoch keys), and nominate one-time holder keys with on-chain-checked VRF proofs seeded by the beacon. Deposits, acknowledgments and releases go on-chain through a relayer, and one recipient request binds the key. Plus `src/`: a chain reader that fails closed and rebuilds the manifest, the chain-only member worker (no network API), and `src/sim.ts` for LocalNet orchestration. Plus `demo/`: Capsule Lab, a local web UI for milestone 4 (`npm run demo`) |
-| Paper alignment (`PAPER_ALIGNMENT_PLAN.md`) | Phases 0–2 done 2026-10-09, unreviewed. Phase 1: `policy-app`'s `EpochCommittee` app and `src/epochs.ts` (per-epoch committees from block-seed VRF sortition, seats in key order, a claimed seat posts one chunked handover message, readers rebuild it from blocks). Phase 2: `crypto-spike/src/ecpss.ts` (pairing-based re-sharing, committee-generated bucket keys, the capsule KEM). Not yet run by workers (Phase 3) or used by capsules (Phase 4) |
+| Paper alignment (`PAPER_ALIGNMENT_PLAN.md`) | Phases 0–3 done 2026-10-09, unreviewed. Phase 3: `policy-app/src/epoch-worker.ts` runs the epochs (nominate, open seats, one handover message per seat from the holder's own account, verify on a thread pool, combine, clean up old committees). Phase 1: `policy-app`'s `EpochCommittee` app and `src/epochs.ts` (per-epoch committees from block-seed VRF sortition, seats in key order, a claimed seat posts one chunked handover message, readers rebuild it from blocks). Phase 2: `crypto-spike/src/ecpss.ts` (pairing-based re-sharing, committee-generated bucket keys, the capsule KEM). Not yet used by capsules (Phase 4) |
 | `randomness-beacon/` | Git submodule pointing to bwmx/randomness-beacon at `0e164c3`. The tests deploy a fresh beacon and run its daemon. Maintained upstream; not modified here |
 
 Not built:
@@ -46,6 +46,8 @@ Phase 0 of PAPER_ALIGNMENT_PLAN.md, 2026-10-09: `crypto-spike` 31 passing tests 
 
 Phases 1–2, 2026-10-09: `crypto-spike` 35 passing tests; `policy-app` 11 passing LocalNet tests (adds 3 for `EpochCommittee`, including an on-chain handover between two real committees).
 
+Phase 3, 2026-10-09: `crypto-spike` 36 passing tests; `policy-app` 12 passing LocalNet tests (adds a 22-handover run of ten member workers with outages, about 3 minutes; passed twice in a row).
+
 Setup from the bundle root (Node 24+, Docker, Git and network access for npm/pnpm/GitHub):
 
 ```sh
@@ -61,7 +63,7 @@ No wallet seed or funded account is needed. Tests generate LocalNet throwaway ac
 
 ## Next work
 
-Per-epoch nomination keys are done (2026-10-09). The proposed next track is PAPER_ALIGNMENT_PLAN.md. Phases 0–2 are done (2026-10-09; see the results sections there). Phase 3, workers running epochs on LocalNet, is next. Separately: wallet integration and browser decryption for Capsule Lab. Before any TestNet step, give each member its own algod node and host and a private network path to it.
+Per-epoch nomination keys are done (2026-10-09). The proposed next track is PAPER_ALIGNMENT_PLAN.md. Phases 0–3 are done (2026-10-09; see the results sections there). Phase 4, capsules on bucket keys, is next. Separately: wallet integration and browser decryption for Capsule Lab. Before any TestNet step, give each member its own algod node and host and a private network path to it.
 
 ## Security boundaries to preserve
 
