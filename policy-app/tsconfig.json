@@ -11,5 +11,5 @@
     "outDir": "dist",
     "sourceMap": true
   },
-  "include": ["src/**/*.ts", "demo/**/*.ts", "test/**/*.ts", "smart_contracts/artifacts/**/*Client.ts"]
+  "include": ["src/**/*.ts", "demo/**/*.ts", "test/**/*.ts", "bench/**/*.ts", "smart_contracts/artifacts/**/*Client.ts"]
 }

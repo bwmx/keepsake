@@ -70,7 +70,7 @@ Acceptance: every three-of-five subset recovers the message; fewer shares are re
 
 ### 2. Algorand application with AlgoKit / Puya TS
 
-**Status: implemented and tested on LocalNet** in `policy-app/` (algorand-typescript/puya-ts 1.3.1). It has been revised twice. First the sender stopped naming custodians, in favour of a public beacon draw. Then that draw was replaced by hidden committees; see the hidden committee design below. The app has an admin-gated, append-only registry where members enroll their own VRF and nomination keys. `register` commits the terms and the registry snapshot and requests beacon randomness atomically, with an exact payment. Members nominate one-time holder keys with VRF proofs checked on-chain. The sender anchors the manifest hash, commitments and deposits once. Custody acknowledgments are authenticated by one-time-key signatures, not `Txn.sender`, and activate the capsule after all five. One recipient request binds `requestId` and the X25519 key inside `[openRound, expiresRound)`. Cleanup and withheld-proof cancellation refund the sender. There is no update, delete or opt-in path. The contract cannot recompute the manifest hash, so custodians compare manifest fields with the on-chain record before acknowledging.
+**Status: implemented and tested on LocalNet** in `policy-app/` (algorand-typescript/puya-ts 1.3.1). It has been revised twice. First the sender stopped naming custodians, in favour of a public beacon draw. Then that draw was replaced by hidden committees; see the hidden committee design below. The app has an admin-gated, append-only registry where members enroll their own VRF keys and post a fresh nomination key every epoch. `register` commits the terms and the registry snapshot and requests beacon randomness atomically, with an exact payment. Members nominate one-time holder keys with VRF proofs checked on-chain. The sender anchors the manifest hash, commitments and deposits once. Custody acknowledgments are authenticated by one-time-key signatures, not `Txn.sender`, and activate the capsule after all five. One recipient request binds `requestId` and the X25519 key inside `[openRound, expiresRound)`. Cleanup and withheld-proof cancellation refund the sender. There is no update, delete or opt-in path. The contract cannot recompute the manifest hash, so custodians compare manifest fields with the on-chain record before acknowledging.
 
 - Scaffold the official Algorand TypeScript project with AlgoKit and pin compiler/toolchain dependencies.
 - Start on LocalNet. Use the current stable `@algorandfoundation/algorand-typescript` and `@algorandfoundation/puya-ts` compatibility pair; verify actual versions before installing.
@@ -129,6 +129,9 @@ All of it uses round-based windows. The gap is that one local server plays every
 
 ### Later research track
 
+See PAPER_ALIGNMENT_PLAN.md (2026-10-09) for the proposed design and phases.
+
+
 Add proactive share refresh only with a reviewed protocol and implementation. Refresh actual shares, not just transport encryption keys. Test cross-epoch share accumulation and failed handovers. Hidden holding committees, anonymous nomination, selective-opening security, and the paper's ECPSS construction are a distinct research scope; ordinary HPKE is not a drop-in replacement for its anonymous encryption requirements.
 
 ## VRF integration decision
@@ -183,9 +186,9 @@ References: [paper §2.3](https://eprint.iacr.org/2020/464.pdf), [Algorand rando
 
 The earlier public beacon draw (`algorand-beacon-v1`, now removed) published who holds the shares. In the paper, VRFs select **nominators** privately, and nominators hand **one-time holder keys** to holders anonymously. This design keeps the beacon only as the common seed and implements steps 1–4 below on unmodified Algorand. It replaces the public draw (`algorand-hidden-v1`).
 
-1. **Registered VRF keys.** The admin admits an account (the Sybil gate). That account then enrolls its own VRF public key and a long-term X25519 nomination key, once and immutably. A capsule only considers members enrolled before its registration (the snapshot), so nobody can pick keys after seeing a seed. *Not implemented:* weighting by online stake via AVM `voter_params_get` / `online_stake`.
+1. **Registered VRF keys.** The admin admits an account (the Sybil gate). That account then enrolls its own VRF public key, once and immutably. A capsule only considers members enrolled before its registration (the snapshot), so nobody can pick keys after seeing a seed. Each member also posts a fresh X25519 nomination key for every epoch (`postNominationKey`, current or next epoch, never replaced), the paper's per-epoch PKI key (§2.1, §3.1.3). A capsule binds to its registration epoch. *Not implemented:* weighting by online stake via AVM `voter_params_get` / `online_stake`.
 2. **Private sortition seeded by the beacon.** For capsule `c` and holder slot `k`, member `i` privately computes `VRF_i(sha256("capsule/nominate/v1" ‖ appId ‖ c ‖ k ‖ beaconRandomness))`. It is eligible if the first 8 output bytes, read as a uint64, fall below `nominatorThreshold`. Eligible members post their proof. The contract checks it with `vrf_verify` against the enrolled key, and requires `Txn.sender` to be that member so a copied proof can't be reused. The lowest output per slot wins. Nominations close at `seedRound + nominationRounds`. Nominators are public once they post. A slot left empty means the capsule can't proceed; there is no fallback.
-3. **Anonymous nomination.** The winning nominator picks a holder uniformly from the snapshot with private randomness. It makes a fresh 32-byte seed from which both one-time holder keys derive (HPKE X25519 and Ed25519). It posts the two public keys plus the seed HPKE-sealed to the holder's nomination key, then erases the seed and its choice. Holders find their slots by trying to decrypt every nomination.
+3. **Anonymous nomination.** The winning nominator picks a holder uniformly, with private randomness, among snapshot members that posted a key for the capsule's epoch. It makes a fresh 32-byte seed from which both one-time holder keys derive (HPKE X25519 and Ed25519). It posts the two public keys plus the seed HPKE-sealed to the holder's key for that epoch, then erases the seed and its choice. Once nominations close, holders find their slots by trying to decrypt every nomination. Each member erases an epoch's private key once every capsule of that epoch has closed nominations.
 4. **Hidden holders, chain as message board.**
    - The sender builds the manifest from the slot public keys (descriptor IDs `slot-0`…`slot-4`).
    - It anchors the manifest hash on-chain together with the payload hash, the five share commitments and the five HPKE deposits, so anyone can rebuild the manifest from chain data and check the hash.
@@ -195,17 +198,16 @@ The earlier public beacon draw (`algorand-beacon-v1`, now removed) published who
    - The payload ciphertext stays off-chain; its hash is anchored.
 
 Accepted consequences, stated plainly:
-- **A corrupt nominator controls its slot.** It knows the one-time keys until it erases them. So a slot is corrupt if its nominator *or* its holder is, roughly `1 − (1 − f)²` for a corrupt fraction `f`.
-- **Holders are drawn with replacement.** One member can hold several slots.
+- **A corrupt nominator controls its slot.** It knows the one-time keys until it erases them. So a slot is corrupt if its nominator *or* its holder is, roughly `1 − (1 − f)²` for a corrupt fraction `f`. The paper has the same "double dip" (§1.2); it is why its tolerance stops at f < 1 − √0.5 ≈ 29%.
+- **Holders are drawn with replacement.** One member can hold several slots. The paper also picks each nominee uniformly from all parties (§3.1.2).
 - **Small 3-of-5 committees tolerate far less corruption than the public draw.** These risks shrink only with large committees (step 5).
-- **No forward secrecy for nominations** (found while building step 5). Deposits and sealed holder seeds stay on-chain forever, and a member's long-term nomination key decrypts every seed nominated to it. Compromising that key later exposes those shares even after expiry, and a threshold of such keys exposes the secret. The same property lets a restarted member regain custody from chain data. The fix is rotating, erased nomination keys (for example per epoch, with capsules bound to the current keys). Not implemented.
+- **Forward secrecy rests on erasure** (fixed 2026-10-09; previously a long-term nomination key decrypted every seed ever sealed to it). Deposits and sealed seeds stay on-chain forever, but each epoch's nomination key lives only in its worker's memory and is erased once the epoch's nominations close. `createApplication` requires `8 + nominationRounds < epochRounds`, so the 3-entry key ring never overwrites a key still in use. The paper erases before a holder posts because posting reveals the holder (§1.2). Here the relayer posts, so erasure at the end of the epoch suffices. A restarted member cannot reopen its seeds, so it loses custody.
 - **Anonymity is not proven.** HPKE's ability to hide the recipient and its security when some holders are later exposed have not been reviewed against the paper's requirements.
 - **Erasure, network-level privacy and liveness remain assumptions.**
 
 Step 5 is implemented. The sender picks up to 64 slots and a minimum committee. The committee is the filled slots, with threshold `⌊n/2⌋ + 1`. Deposits and cleanup are batched, and activation needs a threshold of acknowledgments.
 
 Not implemented:
-- Forward-secure (rotating) nomination keys.
 - Step 6: re-sharing between epochs (ECPSS).
 - Stake weighting.
 

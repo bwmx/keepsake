@@ -27,6 +27,7 @@ interface DemoCapsule {
   gone?: boolean;
   busy?: boolean;
   pausedAtOpen?: boolean;
+  epoch?: string; // Registration epoch, for narrating when members erase its nomination keys.
 }
 
 let sim: LocalNetSim | undefined;
@@ -37,6 +38,7 @@ const capsules = new Map<string, DemoCapsule>();
 const narration: { at: number; text: string; private?: boolean; tone?: 'ok' | 'warn' | 'bad' }[] = [];
 const clock = { running: true, rate: 1 };
 let seenEvents = 0;
+const erasedEpochs = new Set<string>();
 
 const say = (text: string, o: { private?: boolean; tone?: 'ok' | 'warn' | 'bad' } = {}) => {
   narration.push({ at: Date.now(), text, ...o });
@@ -57,6 +59,7 @@ async function start(o: { members: number; nominationRounds: number; perSlot: nu
     capsules.clear();
     narration.length = 0;
     seenEvents = 0;
+    erasedEpochs.clear();
     const threshold = o.perSlot >= o.members ? ANY_RANK : (2n ** 64n * BigInt(Math.round(o.perSlot * 1000))) / BigInt(o.members * 1000);
     settings = { members: o.members, nominationRounds: BigInt(o.nominationRounds), perSlot: o.perSlot };
     say(`Deploying a fresh randomness beacon (own VRF key + daemon), the policy app, and enrolling ${o.members} members…`);
@@ -84,6 +87,7 @@ async function drive() {
         c.gone = true;
         continue;
       }
+      c.epoch ??= record.epoch.toString();
       // Pause the round clock once when the access window opens, so a presenter can act before it expires.
       if (!c.pausedAtOpen && record.stage === STAGE.ACTIVE && round >= record.openRound && clock.running) {
         c.pausedAtOpen = true;
@@ -115,6 +119,11 @@ async function drive() {
     if (e.custody) say(`${who} found it holds capsule ${e.custody} slot ${e.slot} and acknowledged via the relayer.`, { private: true });
     if (e.released) say(`${who} released capsule ${e.released} slot ${e.slot} to the bound recipient key via the relayer.`, { private: true });
     if (e.disposed) say(`${who} disposed its share for capsule ${e.disposed} slot ${e.slot} at expiry.`, { private: true });
+    const epoch = String(e.erased);
+    if (e.erased && !erasedEpochs.has(epoch) && [...capsules.values()].some(c => c.epoch === epoch)) {
+      erasedEpochs.add(epoch);
+      say(`Members are erasing their epoch-${epoch} nomination keys: every capsule of that epoch has closed nominations, so stealing a member's state later cannot reopen those seeds.`, { private: true });
+    }
     if (e.offline) say(`${who} went offline.`, { tone: 'warn' });
   }
   seenEvents = sim.events.length;

@@ -9,7 +9,7 @@ import { Algodv2, secretKeyToMnemonic } from 'algosdk';
 import { ChainReader, slotRange, type ChainPins } from '../src/chain.js';
 import { ANY_RANK } from '../src/sim.js';
 import {
-  STAGE, closeAt, record, seed, waitFor, waitStage, winners, withSim, type CapsuleTerms, type LocalNetSim,
+  STAGE, closeAt, freshEpoch, record, seed, waitFor, waitStage, winners, withSim, type CapsuleTerms, type LocalNetSim,
 } from './localnet.js';
 
 const plaintext = new TextEncoder().encode('Synthetic LocalNet secret');
@@ -27,11 +27,14 @@ async function nominationsSettled(sim: LocalNetSim, c: CapsuleTerms) {
   });
 }
 
-test('step 5 end to end: 24 members, 16 slots, variable committee, majority threshold, hidden holders, restart', () =>
+test('step 5 end to end: 24 members, 16 slots, variable committee, majority threshold, hidden holders, per-epoch keys', () =>
   withSim({ members: 24, nominationRounds: 60n, nominatorThreshold: RATE }, async sim => {
     await sim.startMembers();
-    const c = await sim.register({ slots: 16, minHolders: 9, openIn: 40n, length: 30n });
+    const { epoch } = await freshEpoch(sim);
+    // The window is long enough for the next epoch's key posts (one per member) to land inside it.
+    const c = await sim.register({ slots: 16, minHolders: 9, openIn: 40n, length: 80n });
     const id = c.capsuleId;
+    assert.equal((await record(sim, id)).epoch, epoch);
     await seed(sim, c);
     await nominationsSettled(sim, c);
     // Each slot went to its lowest-ranked eligible member; a slot is empty exactly when nobody was eligible.
@@ -64,13 +67,14 @@ test('step 5 end to end: 24 members, 16 slots, variable committee, majority thre
     const result = await sim.recover(id, anchor, capsule.payload, request, keys.privateKey);
     assert.deepEqual(result.plaintext, plaintext);
 
-    // On-chain, members only enrolled and nominated; every acknowledgment and release came from the relayer.
+    // On-chain, members only enrolled, posted nomination keys and nominated; every acknowledgment and release came
+    // from the relayer.
     const target = await sim.lastRound();
     await waitFor('indexer', async () => (await sim.algorand.client.indexer.makeHealthCheck().do()).round >= target);
     const { transactions } = await sim.algorand.client.indexer.searchForTransactions().applicationID(sim.app.appId).limit(1000).do();
     const selector = (name: string) => Buffer.from(sim.app.appClient.getABIMethod(name).getSelector()).toString('hex');
     const custodyCalls = [selector('acknowledgeCustody'), selector('postRelease')];
-    const memberCalls = [selector('enroll'), selector('nominate')];
+    const memberCalls = [selector('enroll'), selector('postNominationKey'), selector('nominate')];
     const memberAddresses = sim.members.map(m => m.account.toString());
     let custodyCount = 0;
     for (const txn of transactions) {
@@ -83,15 +87,19 @@ test('step 5 end to end: 24 members, 16 slots, variable committee, majority thre
     }
     assert.equal(custodyCount, Number(filled) * 2 - lost);
 
-    // Deposits live on-chain, so a member that comes back regains its slots from chain data and its long-term
-    // nomination key (the forward-secrecy caveat), then releases them too.
+    // Nomination keys lived only in the stopped worker's memory, so a member that comes back cannot reopen its seeds
+    // from chain data. Neither could anyone who later stole a member's state: online members erase each epoch's key
+    // once that epoch's nominations are closed, while they still hold custody.
     const back = offline[0]!;
     await sim.startMember(back);
-    await waitFor('custody regained', async () => (await released()) === Number(filled) - lost + holdings.get(back.index)!.length);
+    await sleep(3000); // Several polls.
+    assert.equal(await released(), Number(filled) - lost);
+    const online = [...holdings].filter(([index]) => sim.members[index]!.worker && index !== back.index);
+    await waitFor('epoch keys erased', async () => online.every(([index]) =>
+      sim.events.some(e => e.member === index && e.erased === epoch.toString())));
 
     // Workers dispose at expiresRound by watching rounds; the delivered responses still decrypt.
     await sim.advancePast(c.expiresRound);
-    const online = [...holdings].filter(([index]) => sim.members[index]!.worker);
     await waitFor('disposal', async () => online.every(([index, held]) =>
       sim.events.filter(e => e.member === index && e.disposed === id.toString()).length >= held.length));
     assert.deepEqual((await sim.recover(id, anchor, capsule.payload, request, keys.privateKey)).plaintext, plaintext);
@@ -100,6 +108,7 @@ test('step 5 end to end: 24 members, 16 slots, variable committee, majority thre
 test('holders refuse custody when the anchored hash does not match the chain data, so the capsule never activates', () =>
   withSim({ members: 8, nominationRounds: 40n }, async sim => {
     await sim.startMembers();
+    await freshEpoch(sim);
     const c = await sim.register({ slots: 5 });
     await seed(sim, c);
     await nominationsSettled(sim, c);
@@ -122,19 +131,19 @@ test('the chain reader fails closed; the worker CLI starts only with matching en
   await assert.rejects(reader({}).capsule(999_999_999n));
 
   const m = sim.members[0]!;
-  const cli = (nominationSeed: Uint8Array) => {
+  const cli = (vrfSecretKey: Uint8Array) => {
     const child = spawn(process.execPath, [path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../src/worker.js')], {
       stdio: ['ignore', 'pipe', 'pipe'], env: { PATH: process.env.PATH ?? '', ALGOD_SERVER: 'http://localhost', ALGOD_PORT: '4001',
         ALGOD_TOKEN: 'a'.repeat(64), GENESIS_HASH: sim.pins.genesisHash, APP_ID: sim.pins.appId.toString(),
         BEACON_APP_ID: sim.pins.beaconAppId.toString(), MAX_ROUND_AGE_MS: '0', MEMBER_MNEMONIC: secretKeyToMnemonic(m.account.account.sk),
-        VRF_SECRET_KEY: Buffer.from(m.vrfSecretKey).toString('base64'), NOMINATION_SEED: Buffer.from(nominationSeed).toString('base64'),
+        VRF_SECRET_KEY: Buffer.from(vrfSecretKey).toString('base64'),
         RELAYER_MNEMONIC: secretKeyToMnemonic(sim.relayer.account.sk) } });
     return { child, first: createInterface({ input: child.stdout! })[Symbol.asyncIterator]().next() };
   };
-  const good = cli(m.nominationSeed);
+  const good = cli(m.vrfSecretKey);
   assert.deepEqual(JSON.parse((await good.first).value as string), { ready: m.account.toString() });
   good.child.kill('SIGTERM');
-  const bad = cli(new Uint8Array(32).fill(9));
+  const bad = cli(new Uint8Array(64).fill(9));
   const stderr: string[] = [];
   bad.child.stderr!.on('data', d => stderr.push(String(d)));
   assert.equal(await new Promise(resolve => bad.child.on('exit', resolve)), 1);

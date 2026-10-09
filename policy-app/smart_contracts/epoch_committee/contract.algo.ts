@@ -1,0 +1,202 @@
+import {
+  Account, BoxMap, Bytes, Contract, Global, GlobalState, OpUpFeeSource, Txn, VrfVerify, abimethod, assert, clone,
+  ensureBudget, op, readonly, type bytes, type uint64,
+} from '@algorandfoundation/algorand-typescript'
+
+const VRF_BUDGET: uint64 = 6_300 // vrf_verify costs 5,700.
+const SIG_BUDGET: uint64 = 2_500 // ed25519verify_bare costs 1,900.
+// `block` reads only rounds in (LastValid − 1002, FirstValid), so the seed is copied early (PAPER_ALIGNMENT_PLAN.md
+// Phase 0). Nominations, which copy it if nobody has, must therefore end within this many rounds of the seed round.
+const SEED_LOOKBACK: uint64 = 990
+const BATCH: uint64 = 7
+
+// Admitted by the admin (Sybil gate; stake weighting is Phase 5) and enrolled by the member itself.
+export type Member = { account: Account; vrfKey: bytes<32>; enrolledRound: uint64 }
+// The paper's per-epoch "long-term" key (§2.1): receives the seeds of seats nominated to this member in that epoch.
+export type EpochKey = { epoch: uint64; key: bytes<32> }
+// Committee c is nominated in epoch c − 1 from the block seed of that epoch's first round, and hands over in epoch c.
+export type Committee = { seed: bytes<32>; seats: uint64; finalized: uint64 }
+// One seat, created by its nominator. The holder is unknown until it claims the seat to post its single message.
+export type Seat = {
+  epk: bytes<96> // One-time BLS12-381 G2 key that receives encrypted subshares.
+  sigKey: bytes<32> // One-time Ed25519 key; seats are ordered by it off-chain (§3.1.2 step 5).
+  sealedSeed: bytes<80> // HPKE(enc 32 || ct 48) of the seed behind both keys, to the nominee's epoch key.
+  holder: Account // Zero until claimed: the account that posts this seat's handover message.
+  digest: bytes<32> // Running SHA-256 over the message chunks, rebuilt by readers from block data.
+  chunks: uint64
+  finalized: boolean
+}
+
+/**
+ * Epoch committees for evolving-committee proactive secret sharing (eprint 2020/464 §3; PAPER_ALIGNMENT_PLAN.md
+ * Phase 1). In each epoch, VRF-eligible members nominate the next committee's anonymous seats, then the current
+ * committee's holders each claim their seat and post one handover message as app-call arguments. The contract orders
+ * nothing and checks no cryptography beyond sortition and seat ownership; members verify messages off-chain.
+ * No update/delete/opt-in handlers exist, so the AVM rejects those calls.
+ */
+export class EpochCommittee extends Contract {
+  admin = GlobalState<Account>({ key: 'admin' })
+  epochRounds = GlobalState<uint64>({ key: 'epochRounds' })
+  nominationRounds = GlobalState<uint64>({ key: 'nominationRounds' }) // Rounds 1..this of each epoch.
+  handoverRounds = GlobalState<uint64>({ key: 'handoverRounds' }) // The rounds right after nominations.
+  nominatorThreshold = GlobalState<uint64>({ key: 'nominatorThreshold' }) // Eligible iff VRF rank < this.
+  registrySize = GlobalState<uint64>({ key: 'registrySize', initialValue: 0 })
+  registry = BoxMap<uint64, Member>({ keyPrefix: 'm' })
+  admitted = BoxMap<Account, uint64>({ keyPrefix: 'a' }) // 0 = admitted, n = enrolled at index n − 1.
+  nominationKeys = BoxMap<bytes, EpochKey>({ keyPrefix: 'k' }) // Key: itob(index) || itob(epoch % 3).
+  committees = BoxMap<uint64, Committee>({ keyPrefix: 'c' })
+  seats = BoxMap<bytes, Seat>({ keyPrefix: 'n' }) // Key: itob(committee) || itob(nominator index).
+
+  @abimethod({ onCreate: 'require' })
+  createApplication(epochRounds: uint64, nominationRounds: uint64, handoverRounds: uint64, nominatorThreshold: uint64): void {
+    assert(nominationRounds > 0 && handoverRounds > 0 && nominatorThreshold > 0, 'Invalid parameters')
+    assert(nominationRounds <= SEED_LOOKBACK, 'Nomination window too long')
+    // Both windows fit in one epoch, so a ring entry is overwritten only after its epoch's nominations end.
+    assert(nominationRounds + handoverRounds < epochRounds, 'Epoch too short')
+    this.admin.value = Txn.sender
+    this.epochRounds.value = epochRounds
+    this.nominationRounds.value = nominationRounds
+    this.handoverRounds.value = handoverRounds
+    this.nominatorThreshold.value = nominatorThreshold
+  }
+
+  // The admin funds registry, key, committee and seat boxes by pre-funding the app account.
+  admitMember(account: Account): void {
+    assert(Txn.sender === this.admin.value, 'Not admin')
+    assert(!this.admitted(account).exists, 'Already admitted')
+    this.admitted(account).value = 0
+  }
+
+  enroll(vrfKey: bytes<32>): void {
+    const entry = this.admitted(Txn.sender)
+    assert(entry.exists, 'Not admitted')
+    assert(entry.value === 0, 'Already enrolled')
+    const index = this.registrySize.value
+    this.registry(index).value = { account: Txn.sender, vrfKey, enrolledRound: Global.round }
+    entry.value = index + 1
+    this.registrySize.value = index + 1
+  }
+
+  /** A fresh nomination key for the current or next epoch, once, never replaced (ring of 3 per member). */
+  postNominationKey(epoch: uint64, key: bytes<32>): void {
+    const entry = this.admitted(Txn.sender)
+    assert(entry.exists && entry.value > 0, 'Not enrolled')
+    const current: uint64 = Global.round / this.epochRounds.value
+    assert(epoch === current || epoch === current + 1, 'Wrong epoch')
+    const box = this.nominationKeys(op.itob(entry.value - 1).concat(op.itob(epoch % 3)))
+    assert(!box.exists || box.value.epoch !== epoch, 'Already posted')
+    box.value = { epoch, key }
+  }
+
+  /** Copies committee c's seed (the block seed of epoch c − 1's first round) into state. Anyone; needs a short validity window. */
+  captureSeed(committee: uint64): void {
+    this.seedOf(committee)
+  }
+
+  /**
+   * One nomination per member per epoch, in the epoch's nomination window, for the next committee (§3.1.2). The member
+   * proves VRF(sha256("ecpss/nominate/v1" || appId || committee || seed)) with its enrolled key, ranks below the
+   * threshold, and posts one seat: one-time keys plus their seed sealed to a uniformly chosen member's epoch key.
+   */
+  nominate(nominator: uint64, proof: bytes<80>, epk: bytes<96>, sigKey: bytes<32>, sealedSeed: bytes<80>): void {
+    const start: uint64 = (Global.round / this.epochRounds.value) * this.epochRounds.value
+    assert(Global.round > start && Global.round <= start + this.nominationRounds.value, 'Not nominating')
+    const committee: uint64 = Global.round / this.epochRounds.value + 1
+    assert(nominator < this.registrySize.value, 'Unknown member')
+    const member = clone(this.registry(nominator).value)
+    assert(Txn.sender === member.account, 'Not the nominator') // A copied proof is useless to anyone else.
+    assert(member.enrolledRound < start, 'Enrolled after the seed round')
+    const seat = this.seats(op.itob(committee).concat(op.itob(nominator)))
+    assert(!seat.exists, 'Already nominated')
+    const seed = this.seedOf(committee)
+    ensureBudget(VRF_BUDGET, OpUpFeeSource.GroupCredit)
+    const alpha = op.sha256(Bytes('ecpss/nominate/v1').concat(op.itob(Global.currentApplicationId.id))
+      .concat(op.itob(committee)).concat(seed))
+    const [output, verified] = op.vrfVerify(VrfVerify.VrfAlgorand, alpha, proof, member.vrfKey)
+    assert(verified, 'Invalid VRF proof')
+    assert(op.btoi(op.extract(output, 0, 8)) < this.nominatorThreshold.value, 'Not eligible')
+    seat.value = { epk, sigKey, sealedSeed, holder: Global.zeroAddress, digest: Bytes<32>({ length: 32 }), chunks: 0, finalized: false }
+    const record = this.committees(committee)
+    record.value.seats += 1
+  }
+
+  /**
+   * A holder takes its seat for the handover window of epoch `committee`: the seat's one-time key signs
+   * "ecpss/claim/v1" || appId || committee || nominator || holder. Only that account may then post the message.
+   */
+  claim(committee: uint64, nominator: uint64, holder: Account, signature: bytes<64>): void {
+    const seat = this.openSeat(committee, nominator)
+    assert(seat.value.holder === Global.zeroAddress, 'Already claimed')
+    ensureBudget(SIG_BUDGET, OpUpFeeSource.GroupCredit)
+    const message = Bytes('ecpss/claim/v1').concat(op.itob(Global.currentApplicationId.id)).concat(op.itob(committee))
+      .concat(op.itob(nominator)).concat(holder.bytes)
+    assert(op.ed25519verifyBare(message, signature, seat.value.sigKey), 'Invalid seat signature')
+    seat.value.holder = holder
+  }
+
+  /** Appends one chunk (four argument parts plus the note) to the seat's running digest. */
+  postChunk(committee: uint64, nominator: uint64, a: bytes, b: bytes, c: bytes, d: bytes): void {
+    const seat = this.openSeat(committee, nominator)
+    assert(Txn.sender === seat.value.holder, 'Not the holder')
+    assert(!seat.value.finalized, 'Finalized')
+    // Parts are hashed first: an AVM byte value holds at most 4,096 bytes.
+    seat.value.digest = op.sha256(seat.value.digest.concat(op.sha256(a)).concat(op.sha256(b)).concat(op.sha256(c))
+      .concat(op.sha256(d)).concat(op.sha256(Txn.note)))
+    seat.value.chunks += 1
+  }
+
+  finalize(committee: uint64, nominator: uint64): void {
+    const seat = this.openSeat(committee, nominator)
+    assert(Txn.sender === seat.value.holder, 'Not the holder')
+    assert(!seat.value.finalized, 'Finalized')
+    seat.value.finalized = true
+    this.committees(committee).value.finalized += 1
+  }
+
+  /** Anyone, once committee c's epoch is over: up to 7 seats per call, then `deleteCommittee`. */
+  deleteSeats(committee: uint64, nominators: uint64[]): void {
+    assert(Global.round >= (committee + 1) * this.epochRounds.value, 'Committee still active')
+    assert(nominators.length <= BATCH, 'Invalid batch')
+    const record = this.committees(committee)
+    for (const n of nominators) {
+      if (this.seats(op.itob(committee).concat(op.itob(n))).delete()) record.value.seats -= 1
+    }
+  }
+
+  deleteCommittee(committee: uint64): void {
+    assert(Global.round >= (committee + 1) * this.epochRounds.value, 'Committee still active')
+    assert(this.committees(committee).value.seats === 0, 'Seats remain')
+    this.committees(committee).delete()
+  }
+
+  private seedOf(committee: uint64): bytes<32> {
+    assert(committee > 0, 'No committee 0')
+    const record = this.committees(committee)
+    if (!record.exists) record.value = { seed: op.Block.blkSeed((committee - 1) * this.epochRounds.value), seats: 0, finalized: 0 }
+    return record.value.seed
+  }
+
+  // The seat of committee c during the handover window of epoch c.
+  private openSeat(committee: uint64, nominator: uint64) {
+    const start: uint64 = committee * this.epochRounds.value + this.nominationRounds.value
+    assert(Global.round > start && Global.round <= start + this.handoverRounds.value, 'Not handing over')
+    const seat = this.seats(op.itob(committee).concat(op.itob(nominator)))
+    assert(seat.exists, 'No such seat')
+    return seat
+  }
+
+  @readonly
+  getMember(index: uint64): Member {
+    return this.registry(index).value
+  }
+
+  @readonly
+  getCommittee(committee: uint64): Committee {
+    return this.committees(committee).value
+  }
+
+  @readonly
+  getSeat(committee: uint64, nominator: uint64): Seat {
+    return this.seats(op.itob(committee).concat(op.itob(nominator))).value
+  }
+}

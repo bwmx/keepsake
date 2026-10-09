@@ -7,7 +7,6 @@ import { AlgorandClient, Config, algo, microAlgo } from '@algorandfoundation/alg
 import { nullLogger } from '@algorandfoundation/algokit-utils/types/logging';
 import vrf from '@bwmx/algorand-vrf-utils-ts';
 import { secretKeyToMnemonic } from 'algosdk';
-import { deriveEphemeralKey, type EphemeralKeyPair } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/crypto.js';
 import {
   createAccessRequest, createCapsule, recover, type AccessRequest, type Capsule,
 } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/protocol.js';
@@ -30,16 +29,14 @@ const ALGOD = { server: 'http://localhost', port: 4001, token: 'a'.repeat(64) };
 export const SELECTION_DELAY = 8n;
 export const ANY_RANK = 2n ** 64n - 1n; // nominatorThreshold that makes every member eligible for every slot.
 
-// Protocol MBR: 2500 + 400/byte of key + value. Capsule: 'c' + u64, 321 bytes. Slot: 's' + u64 + u64, 419 bytes.
-export const boxMbr = (slots: number) => 2_500 + 400 * (1 + 8 + 321) + slots * (2_500 + 400 * (1 + 16 + 419));
+// Protocol MBR: 2500 + 400/byte of key + value. Capsule: 'c' + u64, 329 bytes. Slot: 's' + u64 + u64, 419 bytes.
+export const boxMbr = (slots: number) => 2_500 + 400 * (1 + 8 + 329) + slots * (2_500 + 400 * (1 + 16 + 419));
 
 type Funded = Awaited<ReturnType<LocalNetSim['fund']>>;
 export interface Member {
   index: number;
   account: Funded;
   vrfSecretKey: Uint8Array;
-  nominationSeed: Uint8Array;
-  nomination: EphemeralKeyPair;
   worker?: Awaited<ReturnType<typeof startWorker>>;
 }
 export interface CapsuleTerms { capsuleId: bigint; slots: number; seedRound: bigint; deadline: bigint; openRound: bigint; expiresRound: bigint }
@@ -49,6 +46,7 @@ export interface SimOptions {
   members?: number;
   nominationRounds?: bigint;
   nominatorThreshold?: bigint;
+  epochRounds?: bigint; // Must exceed SELECTION_DELAY + nominationRounds.
   beaconDaemon?: boolean;
   staleRequestTimeout?: bigint;
   pollMs?: number;
@@ -73,11 +71,13 @@ export class LocalNetSim {
   members: Member[] = [];
   costs!: { fees: bigint; boxMbr: bigint };
   #pollMs = 500;
+  #epochRounds = 120n;
 
   static async create(o: SimOptions = {}): Promise<LocalNetSim> {
     await vrf.init();
     const sim = new LocalNetSim();
     sim.#pollMs = o.pollMs ?? 500;
+    sim.#epochRounds = o.epochRounds ?? 120n;
     const fund = (amount = 50) => sim.fund(amount);
     [sim.admin, sim.sender, sim.recipient, sim.outsider, sim.relayer] = await Promise.all([fund(), fund(), fund(), fund(), fund(200)]);
     sim.beacon = await deployBeacon(sim, o.beaconDaemon ?? true, o.staleRequestTimeout ?? 1000n);
@@ -96,22 +96,19 @@ export class LocalNetSim {
     return account;
   }
 
-  async deployPolicy(nominationRounds: bigint, nominatorThreshold: bigint) {
+  async deployPolicy(nominationRounds: bigint, nominatorThreshold: bigint, epochRounds = this.#epochRounds) {
     const factory = this.algorand.client.getTypedAppFactory(CapsulePolicyFactory, { defaultSender: this.admin });
     const { appClient } = await factory.send.create.createApplication({
-      args: { beacon: this.beacon.appId, nominationRounds, nominatorThreshold }
+      args: { beacon: this.beacon.appId, nominationRounds, nominatorThreshold, epochRounds }
     });
-    await this.algorand.send.payment({ sender: this.admin, receiver: appClient.appAddress, amount: algo(5) });
+    // Registry and nomination-key boxes: about 0.13 Algo per member, so 8 Algo covers the demo's 40 members.
+    await this.algorand.send.payment({ sender: this.admin, receiver: appClient.appAddress, amount: algo(8) });
     return appClient;
   }
 
-  /** A new member with fresh VRF and nomination keys, admitted by the admin and self-enrolled. */
+  /** A new member with a fresh VRF key, admitted by the admin and self-enrolled. Its worker posts nomination keys. */
   async addMember(target = this.app): Promise<Member> {
-    const nominationSeed = randomBytes(32);
-    const m: Member = {
-      index: this.members.length, account: await this.fund(), vrfSecretKey: vrf.generateKeyPair().secretKey,
-      nominationSeed, nomination: await deriveEphemeralKey(nominationSeed)
-    };
+    const m: Member = { index: this.members.length, account: await this.fund(), vrfSecretKey: vrf.generateKeyPair().secretKey };
     await this.enroll(m, target);
     this.members.push(m);
     return m;
@@ -119,12 +116,7 @@ export class LocalNetSim {
 
   async enroll(m: Member, target = this.app) {
     await target.send.admitCustodian({ args: { account: m.account.toString() } });
-    await target.send.enroll({
-      sender: m.account, args: {
-        vrfKey: m.vrfSecretKey.subarray(32),
-        nominationKey: Buffer.from(m.nomination.publicKey, 'base64url')
-      }
-    });
+    await target.send.enroll({ sender: m.account, args: { vrfKey: m.vrfSecretKey.subarray(32) } });
   }
 
   // --- Member workers (in-process; each has only its own keys plus the shared relayer) ---
@@ -133,7 +125,7 @@ export class LocalNetSim {
     if (m.worker) return;
     m.worker = await startWorker({
       pins: this.pins, algod: ALGOD, memberMnemonic: secretKeyToMnemonic(m.account.account.sk),
-      vrfSecretKey: m.vrfSecretKey, nominationSeed: m.nominationSeed,
+      vrfSecretKey: m.vrfSecretKey,
       relayerMnemonic: secretKeyToMnemonic(this.relayer.account.sk), pollMs: this.#pollMs,
       event: e => this.events.push({ at: Date.now(), member: m.index, ...e }),
     });

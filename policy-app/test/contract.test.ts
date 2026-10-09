@@ -9,14 +9,32 @@ import {
   STAGE, ack, closeAt, nextRoundIs, nominate, postDeposits, record, rejects, seed, slot, sortition, winners, withSim,
 } from './localnet.js';
 
-test('step 1: admin admits, members enroll their own keys once; registration checks committee bounds and payment', () => withSim({}, async sim => {
+test('step 1: admin admits, members enroll VRF keys once and post one nomination key per epoch; registration checks bounds and payment', () => withSim({ epochRounds: 40n }, async sim => {
   const m0 = sim.members[0]!;
   assert.deepEqual(Buffer.from((await sim.app.getMember({ args: { index: 0n } })).vrfKey), Buffer.from(m0.vrfSecretKey.subarray(32)));
   const fresh = await sim.fund();
   await rejects(sim.app.send.admitCustodian({ args: { account: fresh.toString() }, sender: sim.outsider }), 'Not admin');
-  await rejects(sim.app.send.enroll({ sender: fresh, args: { vrfKey: randomBytes(32), nominationKey: randomBytes(32) } }), 'Not admitted');
+  await rejects(sim.app.send.enroll({ sender: fresh, args: { vrfKey: randomBytes(32) } }), 'Not admitted');
   await rejects(sim.app.send.admitCustodian({ args: { account: m0.account.toString() } }), 'Already admitted');
-  await rejects(sim.app.send.enroll({ sender: m0.account, args: { vrfKey: randomBytes(32), nominationKey: randomBytes(32) } }), 'Already enrolled');
+  await rejects(sim.app.send.enroll({ sender: m0.account, args: { vrfKey: randomBytes(32) } }), 'Already enrolled');
+
+  // Nomination keys (the paper's per-epoch keys): current or next epoch only, once each, in a ring of 3 per member.
+  await rejects(sim.deployPolicy(30n, ANY_RANK, 38n), 'Epoch too short'); // 8 + 30 rounds must fit in an epoch.
+  const post = (epoch: bigint, key = randomBytes(32), sender = m0.account) =>
+    sim.app.send.postNominationKey({ sender, args: { epoch, key } }).then(() => key);
+  const e = (await sim.lastRound()) / 40n + 1n;
+  await nextRoundIs(sim, e * 40n);
+  await rejects(post(e, undefined, fresh), 'Not enrolled');
+  await rejects(post(e - 1n), 'Wrong epoch');
+  await rejects(post(e + 2n), 'Wrong epoch');
+  const key = await post(e);
+  await rejects(post(e), 'Already posted'); // A sealed seed always targets the key its holder posted.
+  await post(e + 1n);
+  assert.deepEqual(Buffer.from((await sim.reader.nominationKey(e, 0n))!), key);
+  assert.equal(await sim.reader.nominationKey(e + 2n, 0n), undefined);
+  await nextRoundIs(sim, (e + 2n) * 40n); // Epoch e + 3 reuses e's ring entry, posted two epochs later.
+  await post(e + 3n);
+  assert.equal(await sim.reader.nominationKey(e, 0n), undefined);
 
   for (const [slots, minHolders] of [[65, 3], [5, 2], [5, 6]]) {
     await rejects(sim.register({ slots: slots!, minHolders: minHolders! }), 'Invalid committee size');
@@ -31,6 +49,7 @@ test('step 1: admin admits, members enroll their own keys once; registration che
   await rejects(sim.register({ amount: sim.payment(5) + 1 }), 'Exact payment required');
   await rejects(sim.register({ receiver: sim.outsider.toString() }), 'Exact payment required');
   const c = await sim.register();
+  assert.equal((await record(sim, c.capsuleId)).epoch, (c.seedRound - SELECTION_DELAY) / 40n); // Registration epoch.
   await rejects(sim.app.send.fulfillRandomness({ sender: sim.outsider, args: {
     requestId: c.capsuleId, requesterAddress: sim.sender.toString(), output: randomBytes(32) } }), 'Unauthorized callback');
   await seed(sim, c);
@@ -83,7 +102,7 @@ test('steps 3–5: variable committee, batched deposits, threshold activation, o
   const best = await winners(sim, c.capsuleId, 8, ANY_RANK);
   const filled = [0n, 1n, 2n, 4n, 5n, 7n]; // Slots 3 and 6 stay empty: the committee is the 6 filled slots.
   const seeds = new Map<bigint, Uint8Array>();
-  for (const k of filled) seeds.set(k, await nominate(sim, sim.members[best[Number(k)]!]!, c.capsuleId, k, { holder: sim.members[7]! }));
+  for (const k of filled) seeds.set(k, await nominate(sim, sim.members[best[Number(k)]!]!, c.capsuleId, k));
   await closeAt(sim, c);
   const closed = await record(sim, c.capsuleId);
   assert.deepEqual([closed.filled, closed.threshold], [6n, 4n]); // Majority of the actual committee.

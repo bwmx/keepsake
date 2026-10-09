@@ -129,7 +129,7 @@
   <section id="setup" class="card" hidden>
     <h3>Set up a LocalNet environment</h3>
     <p>This deploys a fresh copy of the randomness beacon with its own VRF key and runs the beacon's daemon. It also deploys the capsule
-      policy app and enrolls registry members, each with its own VRF and nomination keys, then starts a worker for each member.
+      policy app and enrolls registry members, each with its own VRF key, then starts a worker for each member. Workers post a fresh nomination key every epoch.
       All accounts are LocalNet throwaways. One local server plays every party so you can watch the whole protocol.</p>
     <div class="grid2">
       <div><label for="sMembers">Registry members</label><input id="sMembers" type="number" min="6" max="40" value="16"></div>
@@ -194,8 +194,8 @@
       <div class="card">
         <h2>Members</h2>
         <div id="members"></div>
-        <p class="note">Click a member to take it offline or bring it back. A member that returns regains its slots from chain data:
-          on-chain deposits plus its long-term nomination key. That is the forward-secrecy gap; rotating nomination keys would close it.</p>
+        <p class="note">Click a member to take it offline or bring it back. A member that returns does not regain its slots:
+          its nomination keys lived only in the stopped process, one per epoch, so the on-chain seeds sealed to them stay closed.</p>
       </div>
       <div class="card risk">
         <h2>Collusion risk</h2>

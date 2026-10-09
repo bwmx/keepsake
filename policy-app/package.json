@@ -10,7 +10,8 @@
     "build:contract": "algokit compile ts smart_contracts --out-dir artifacts && algokit generate client smart_contracts/artifacts --output {app_spec_dir}/{contract_name}Client.ts",
     "build": "npm --prefix ../crypto-spike run build && npm run build:contract && tsc -p tsconfig.json",
     "test": "npm run build && node --test --test-concurrency=1 dist/test/*.test.js",
-    "demo": "npm run build && node dist/demo/server.js"
+    "demo": "npm run build && node dist/demo/server.js",
+    "probe": "npm run build && node dist/bench/broadcast-probe.js"
   },
   "dependencies": {
     "@algorandfoundation/algorand-typescript": "1.3.1",

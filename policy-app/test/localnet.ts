@@ -3,7 +3,7 @@ import { randomBytes } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { microAlgo } from '@algorandfoundation/algokit-utils';
 import vrf from '@bwmx/algorand-vrf-utils-ts';
-import { seal } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/crypto.js';
+import { generateEphemeralKey, seal } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/crypto.js';
 import { Custodian } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/protocol.js';
 import { STAGE, ackBody, nominationAlpha, nominationContext, vrfRank } from '../src/chain.js';
 import { LocalNetSim, type CapsuleTerms, type Member, type SimOptions } from '../src/sim.js';
@@ -48,6 +48,19 @@ export async function nextRoundIs(sim: LocalNetSim, target: bigint) {
   assert.equal((await sim.lastRound()) + 1n, target, 'Target round already passed');
 }
 
+/** Every online member has posted its nomination key for each of `epochs` (workers post their own). */
+export const keysReady = (sim: LocalNetSim, epochs: bigint[]) => waitFor('nomination keys', async () =>
+  (await Promise.all(sim.members.filter(m => m.worker).flatMap(m => epochs.map(e => sim.reader.nominationKey(e, BigInt(m.index)))))).every(Boolean));
+
+/** Advance to the start of the next epoch and wait for its keys and the next epoch's, so no key posts land mid-test. */
+export async function freshEpoch(sim: LocalNetSim) {
+  const epochRounds = (await sim.app.state.global.epochRounds())!;
+  const epoch = (await sim.lastRound()) / epochRounds + 1n;
+  await sim.advancePast(epoch * epochRounds);
+  await keysReady(sim, [epoch, epoch + 1n]);
+  return { epoch, epochRounds };
+}
+
 export async function closeAt(sim: LocalNetSim, c: CapsuleTerms) {
   await sim.advancePast(c.deadline - 1n);
   await sim.close(c.capsuleId);
@@ -69,13 +82,16 @@ export async function winners(sim: LocalNetSim, capsuleId: bigint, slots: number
   }));
 }
 
-/** The test plays nominator: one-time holder keys from a fresh seed, sealed to `holder`. Returns the seed. */
-export async function nominate(sim: LocalNetSim, m: Member, capsuleId: bigint, k: bigint, o: { holder?: Member;
+/**
+ * The test plays nominator: one-time holder keys from a fresh seed, sealed to a throwaway nomination key (the
+ * contract cannot see whom a seed is sealed to). Returns the seed.
+ */
+export async function nominate(sim: LocalNetSim, m: Member, capsuleId: bigint, k: bigint, o: {
   sender?: Member['account']; proof?: Uint8Array; index?: number; target?: App } = {}) {
   const target = o.target ?? sim.app;
   const seedBytes = randomBytes(32);
   const keys = await Custodian.fromSeed(`slot-${k}`, seedBytes);
-  const sealed = await seal((o.holder ?? m).nomination.publicKey, seedBytes, nominationContext({ ...sim.pins, appId: target.appId }, capsuleId, k));
+  const sealed = await seal((await generateEphemeralKey()).publicKey, seedBytes, nominationContext({ ...sim.pins, appId: target.appId }, capsuleId, k));
   await target.send.nominate({ coverAppCallInnerTransactionFees: true, maxFee: microAlgo(20_000), sender: o.sender ?? m.account, args: {
     capsuleId, slot: k, nominator: o.index ?? m.index, proof: o.proof ?? (await sortition(sim, m, capsuleId, k, target)).proof,
     holderEncKey: Buffer.from(keys.descriptor.encryptionPublicKey, 'base64url'),

@@ -13,6 +13,8 @@ cd crypto-spike
 npm ci --ignore-scripts
 npm test
 npm run demo
+npm run params   # Committee sizes for the paper alignment plan
+npm run bench    # Pairing re-sharing prototype at C = 64, 120, 200 (a few minutes)
 ```
 
 If handing the folder to another machine, use its own checkout path in the `cd` command. The code has no absolute-path dependencies and needs no `.env`, wallet seed, funded account, Docker, or network access after installing packages. Run only with synthetic secrets.
@@ -43,6 +45,9 @@ The demo generates fresh material on every invocation. It reports a public manif
 | `src/mock-ledger.ts` | Trusted in-memory confirmed-round/authorization test double |
 | `src/demo.ts` | Executable end-to-end demonstration with synthetic data |
 | `test/protocol.test.ts` | Integration and adversarial cases |
+| `src/params.ts`, `test/params.test.ts` | Committee size and threshold for the paper's §3.2 process: the paper's bounds and exact tails (Phase 0 of `../PAPER_ALIGNMENT_PLAN.md`) |
+| `src/ecpss.ts`, `test/ecpss.test.ts` | **Unreviewed** Phase 2 library: seat keys from a nominator's seed, the per-epoch handover message (re-sharing every live bucket, new committee-generated buckets), receiving a handover, reconstruction, the capsule KEM with replay binding, and a strict wire format |
+| `src/pvss.ts`, `test/pvss.test.ts`, `bench/pvss.bench.ts` | **Unreviewed Phase 0 prototype** of the plan's pairing-based re-sharing, committee key generation and capsule KEM, with correctness tests and a benchmark. Not for real secrets |
 | `PROTOCOL.md` | Message encoding, trust and key lifecycle specification |
 | `../IMPLEMENTATION_PLAN.md` | Handoff roadmap including VRF decisions and Puya TS integration |
 
@@ -50,7 +55,7 @@ The demo generates fresh material on every invocation. It reports a public manif
 
 Verified on 2026-10-06 with Node.js v24.15.0, TypeScript 5.9.3, `@types/node` 24.19.1, and the lockfile dependencies:
 
-- `npm test`: strict TypeScript compilation and **26 passing tests**.
+- `npm test`: strict TypeScript compilation and **26 passing tests**. On 2026-10-09 this grew to 31 with the Phase 0 committee-size and pairing-prototype tests, then to 35 with the Phase 2 library tests.
 - `npm run demo`: all six behavioral assertions passed.
 - All ten three-of-five subsets recover the exact original message; four and five responses also work in shuffled order.
 - Insufficient and duplicate responses fail; two unavailable custodians leave three capable of recovery.

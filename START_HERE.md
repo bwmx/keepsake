@@ -3,7 +3,7 @@
 
 ## Resume in one minute
 
-1. Read this file, then IMPLEMENTATION_PLAN.md.
+1. Read this file, then IMPLEMENTATION_PLAN.md, then PAPER_ALIGNMENT_PLAN.md (the proposed route to the paper's ECPSS).
 2. Read crypto-spike/README.md, crypto-spike/PROTOCOL.md and policy-app/README.md.
 3. Inspect the TypeScript sources and tests before changing the protocol.
 
@@ -22,14 +22,14 @@ Working product assumption: private release to one authorized recipient during a
 | Package | State |
 | --- | --- |
 | `crypto-spike/` | Milestone 1: AES-256-GCM payload, majority-threshold Shamir (3–64 custodians; fixed demo 3-of-5), HPKE deposits/responses, Ed25519 response signatures, anchored manifest/share commitments, request binding, best-effort disposal. Its own tests and demo use the trusted in-memory ledger and fixed committee. It now also supports the `algorand-hidden-v1` committee mode, one-time holder keys derived from a seed, manifest-only custody acceptance, domain-separated chain signatures and an async `AuthorizationSource` |
-| `policy-app/` | Milestones 2–3 on LocalNet: the `CapsulePolicy` app (Algorand TypeScript/Puya TS) with hidden, variable-size holder committees (design steps 1–5). Members enroll VRF keys and nominate one-time holder keys with on-chain-checked VRF proofs seeded by the beacon. Deposits, acknowledgments and releases go on-chain through a relayer, and one recipient request binds the key. Plus `src/`: a chain reader that fails closed and rebuilds the manifest, the chain-only member worker (no network API), and `src/sim.ts` for LocalNet orchestration. Plus `demo/`: Capsule Lab, a local web UI for milestone 4 (`npm run demo`) |
+| `policy-app/` | Milestones 2–3 on LocalNet: the `CapsulePolicy` app (Algorand TypeScript/Puya TS) with hidden, variable-size holder committees (design steps 1–5). Members enroll VRF keys, post a fresh nomination key every epoch (erased once that epoch's nominations close, as the paper's per-epoch keys), and nominate one-time holder keys with on-chain-checked VRF proofs seeded by the beacon. Deposits, acknowledgments and releases go on-chain through a relayer, and one recipient request binds the key. Plus `src/`: a chain reader that fails closed and rebuilds the manifest, the chain-only member worker (no network API), and `src/sim.ts` for LocalNet orchestration. Plus `demo/`: Capsule Lab, a local web UI for milestone 4 (`npm run demo`) |
+| Paper alignment (`PAPER_ALIGNMENT_PLAN.md`) | Phases 0–2 done 2026-10-09, unreviewed. Phase 1: `policy-app`'s `EpochCommittee` app and `src/epochs.ts` (per-epoch committees from block-seed VRF sortition, seats in key order, a claimed seat posts one chunked handover message, readers rebuild it from blocks). Phase 2: `crypto-spike/src/ecpss.ts` (pairing-based re-sharing, committee-generated bucket keys, the capsule KEM). Not yet run by workers (Phase 3) or used by capsules (Phase 4) |
 | `randomness-beacon/` | Git submodule pointing to bwmx/randomness-beacon at `0e164c3`. The tests deploy a fresh beacon and run its daemon. Maintained upstream; not modified here |
 
 Not built:
 - Wallet integration and decryption in the browser (milestone 4 remainder).
 - TestNet deployment (milestone 5).
 - Per-member nodes and hosts.
-- Forward-secure nomination keys.
 - Stake weighting.
 - ECPSS re-sharing (step 6).
 
@@ -39,6 +39,12 @@ Verified 2026-10-06 on Node.js v24.15.0, AlgoKit 2.10.2, LocalNet algod 5.0.1, p
 
 - `crypto-spike`: `npm test` gives 26 passing tests; `npm run demo` passes all six checks.
 - `policy-app`: `npm test` gives 8 passing LocalNet tests: 5 contract tests and 3 worker tests, including a 24-member, 16-slot end-to-end run with the real beacon daemon. Capsule Lab was exercised in a browser, desktop and phone widths.
+
+Re-verified 2026-10-09 after per-epoch nomination keys, same toolchain: `crypto-spike` 26 passing; `policy-app` 8 passing, twice. The end-to-end test now also shows that a restarted member cannot reopen its seats and that online holders erase their epoch key while still holding custody. Capsule Lab was smoke-tested through its API: nominations, custody, epoch-key erasure, release and decryption. It was not re-checked in a browser.
+
+Phase 0 of PAPER_ALIGNMENT_PLAN.md, 2026-10-09: `crypto-spike` 31 passing tests (adds the committee-size calculator and the unreviewed pairing prototype). `npm run params` and `npm run bench` in `crypto-spike/`, and `npm run probe` in `policy-app/`, reproduce the plan's numbers. `policy-app` still has 8 passing tests.
+
+Phases 1–2, 2026-10-09: `crypto-spike` 35 passing tests; `policy-app` 11 passing LocalNet tests (adds 3 for `EpochCommittee`, including an on-chain handover between two real committees).
 
 Setup from the bundle root (Node 24+, Docker, Git and network access for npm/pnpm/GitHub):
 
@@ -55,14 +61,14 @@ No wallet seed or funded account is needed. Tests generate LocalNet throwaway ac
 
 ## Next work
 
-Highest priority: forward-secure nomination keys. Without them, on-chain deposits let a member's later key compromise expose shares after expiry; see the hidden committee design in IMPLEMENTATION_PLAN.md. Then wallet integration and browser decryption for Capsule Lab. Before any TestNet step, give each member its own algod node and host and a private network path to it.
+Per-epoch nomination keys are done (2026-10-09). The proposed next track is PAPER_ALIGNMENT_PLAN.md. Phases 0–2 are done (2026-10-09; see the results sections there). Phase 3, workers running epochs on LocalNet, is next. Separately: wallet integration and browser decryption for Capsule Lab. Before any TestNet step, give each member its own algod node and host and a private network path to it.
 
 ## Security boundaries to preserve
 
 - Sender initially knows the key/plaintext. Any three colluding custodians can bypass policy.
 - Fewer than three compromised custodians must hold across the entire capsule lifetime; no proactive share refresh exists.
 - Public VRF output is not a secret encryption key.
-- Nominations have no forward secrecy yet: a member's long-term nomination key plus chain history recovers every share it held.
+- Nomination forward secrecy rests on best-effort erasure. Each member's per-epoch nomination key lives only in worker memory and is dropped once its epoch's nominations close. Until then, and until expiry for one-time keys and shares, a member's stolen live state exposes what it holds. A restart loses custody.
 - The beacon seed is public. The single beacon operator can learn it early and withhold it. The registry admin is the Sybil gate. Nominators are public and control their slot until they erase the seed. A 3-of-5 hidden committee drawn with replacement from a small registry tolerates little corruption. Each worker trusts its own algod node.
 - The manifest hash needs an authenticated trust anchor, not merely a hash supplied by the same untrusted storage server.
 - The mock caller string is not proof of wallet ownership; mock registration does not verify custody acknowledgments.

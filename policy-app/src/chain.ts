@@ -49,7 +49,7 @@ export class ChainReader {
     return status.lastRound;
   }
 
-  private box(...parts: Uint8Array[]) {
+  protected box(...parts: Uint8Array[]) {
     return this.algod.getApplicationBoxByName(this.pins.appId, Buffer.concat(parts)).do();
   }
 
@@ -74,6 +74,13 @@ export class ChainReader {
 
   async member(index: bigint): Promise<Member> {
     return MemberFromTuple(MEMBER.decode((await this.box(Buffer.from('m'), u64(index))).value) as never);
+  }
+
+  /** Member `index`'s nomination key for `epoch`, or undefined if it never posted one (or it was rotated out). */
+  async nominationKey(epoch: bigint, index: bigint): Promise<Uint8Array | undefined> {
+    const value = await this.box(Buffer.from('k'), u64(index), u64(epoch % 3n)).then(b => Buffer.from(b.value),
+      (e: { response?: { status?: number } }) => { if (e.response?.status !== 404) throw e; });
+    return value && value.readBigUInt64BE(0) === epoch ? value.subarray(8, 40) : undefined; // EpochKey: uint64 || byte[32]
   }
 
   // ponytail: lists every box on each call; use an indexer or event feed beyond a demo-sized app.

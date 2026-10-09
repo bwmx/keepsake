@@ -22,8 +22,12 @@ const DEPOSITING: uint64 = 3 // Manifest hash anchored; sender posting commitmen
 const ANCHORED: uint64 = 4 // Every filled slot has its deposit.
 const ACTIVE: uint64 = 5 // At least `threshold` one-time holder keys acknowledged.
 
-// Admitted by the admin (Sybil gate), enrolled by the member itself. Keys are immutable.
-export type Member = { account: Account; vrfKey: bytes<32>; nominationKey: bytes<32> }
+// Admitted by the admin (Sybil gate), enrolled by the member itself. The VRF key is immutable; nomination keys
+// rotate every epoch (postNominationKey).
+export type Member = { account: Account; vrfKey: bytes<32> }
+
+// The paper's per-epoch "long-term" key (§2.1, §3.1.3): a fresh X25519 key that receives holder-seed nominations.
+export type EpochKey = { epoch: uint64; key: bytes<32> }
 
 // Public policy record. Holds no plaintext, shares, or private keys; boxes are publicly readable.
 export type CapsuleRecord = {
@@ -34,6 +38,7 @@ export type CapsuleRecord = {
   seedRound: uint64
   nominationDeadline: uint64
   registrySize: uint64 // Members enrolled before registration; only they can nominate or be nominated.
+  epoch: uint64 // Registration epoch: holder seeds are sealed to members' nomination keys for this epoch.
   beaconDeposit: uint64 // Beacon box deposit, refunded to the sender on cleanup.
   stage: uint64
   slotCount: uint64
@@ -89,37 +94,58 @@ export class CapsulePolicy extends Contract {
   beacon = GlobalState<Application>({ key: 'beacon' })
   nominationRounds = GlobalState<uint64>({ key: 'nominationRounds' })
   nominatorThreshold = GlobalState<uint64>({ key: 'nominatorThreshold' }) // Eligible iff VRF rank < this.
+  epochRounds = GlobalState<uint64>({ key: 'epochRounds' }) // Epoch = round / epochRounds.
   registrySize = GlobalState<uint64>({ key: 'registrySize', initialValue: 0 })
   registry = BoxMap<uint64, Member>({ keyPrefix: 'm' })
   admitted = BoxMap<Account, uint64>({ keyPrefix: 'a' }) // 0 = admitted, n = enrolled at index n - 1.
+  nominationKeys = BoxMap<bytes, EpochKey>({ keyPrefix: 'k' }) // Key: itob(index) || itob(epoch % 3).
   capsules = BoxMap<uint64, CapsuleRecord>({ keyPrefix: 'c' })
   slots = BoxMap<bytes, Slot>({ keyPrefix: 's' }) // Key: itob(capsuleId) || itob(slot).
 
   @abimethod({ onCreate: 'require' })
-  createApplication(beacon: Application, nominationRounds: uint64, nominatorThreshold: uint64): void {
+  createApplication(beacon: Application, nominationRounds: uint64, nominatorThreshold: uint64, epochRounds: uint64): void {
     assert(nominationRounds > 0 && nominatorThreshold > 0, 'Invalid parameters')
+    // Every capsule closes nominations before the epoch after its registration ends (see postNominationKey).
+    assert(SELECTION_DELAY + nominationRounds < epochRounds, 'Epoch too short')
     this.admin.value = Txn.sender
     this.beacon.value = beacon
     this.nominationRounds.value = nominationRounds
     this.nominatorThreshold.value = nominatorThreshold
+    this.epochRounds.value = epochRounds
   }
 
-  // The admin funds registry boxes by pre-funding the app account.
+  // The admin funds registry and nomination-key boxes by pre-funding the app account.
   admitCustodian(account: Account): void {
     assert(Txn.sender === this.admin.value, 'Not admin')
     assert(!this.admitted(account).exists, 'Already admitted')
     this.admitted(account).value = 0
   }
 
-  // Step 1: the member registers its own VRF and nomination keys, once, before any capsule that may use them.
-  enroll(vrfKey: bytes<32>, nominationKey: bytes<32>): void {
+  // Step 1: the member registers its own VRF key, once, before any capsule that may use it.
+  enroll(vrfKey: bytes<32>): void {
     const entry = this.admitted(Txn.sender)
     assert(entry.exists, 'Not admitted')
     assert(entry.value === 0, 'Already enrolled')
     const index = this.registrySize.value
-    this.registry(index).value = { account: Txn.sender, vrfKey, nominationKey }
+    this.registry(index).value = { account: Txn.sender, vrfKey }
     entry.value = index + 1
     this.registrySize.value = index + 1
+  }
+
+  /**
+   * The member posts a fresh nomination key for the current or next epoch, once; it cannot be replaced, so a sealed
+   * seed always targets the key its holder posted. The member erases the private key after that epoch's capsules
+   * close nominations, so later compromise cannot open their seeds. Each member has a ring of 3 entries: epoch e is
+   * overwritten by e + 3, posted no earlier than epoch e + 2, after every epoch-e capsule closed nominations.
+   */
+  postNominationKey(epoch: uint64, key: bytes<32>): void {
+    const entry = this.admitted(Txn.sender)
+    assert(entry.exists && entry.value > 0, 'Not enrolled')
+    const current: uint64 = Global.round / this.epochRounds.value
+    assert(epoch === current || epoch === current + 1, 'Wrong epoch')
+    const box = this.nominationKeys(op.itob(entry.value - 1).concat(op.itob(epoch % 3)))
+    assert(!box.exists || box.value.epoch !== epoch, 'Already posted')
+    box.value = { epoch, key }
   }
 
   /**
@@ -152,7 +178,7 @@ export class CapsulePolicy extends Contract {
     }).returnValue
     this.capsules(capsuleId).value = {
       sender: Txn.sender, recipient, openRound, expiresRound, seedRound, nominationDeadline, registrySize,
-      beaconDeposit: costs.boxMbr, stage: AWAITING_SEED, slotCount, minHolders, filled: 0, threshold: 0,
+      epoch: Global.round / this.epochRounds.value, beaconDeposit: costs.boxMbr, stage: AWAITING_SEED, slotCount, minHolders, filled: 0, threshold: 0,
       deposits: 0, acks: 0, slotBoxes: 0, randomness: Bytes<32>({ length: 32 }),
       manifestHash: Bytes<32>({ length: 32 }), payloadHash: Bytes<32>({ length: 32 }), requested: false, requestId: Bytes<16>({ length: 16 }), recipientKey: Bytes<32>({ length: 32 }),
     }

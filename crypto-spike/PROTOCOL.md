@@ -104,9 +104,10 @@ Implemented on LocalNet in `../policy-app`:
 - network/app domain binding and fresh chain-state verification that fails closed;
 - beacon VRF committee selection bound into the manifest hash;
 - hidden one-time holder keys nominated by VRF sortition seeded by the beacon;
+- per-epoch nomination keys: each capsule binds to its registration epoch, and members keep that epoch's key only in memory and erase it once every capsule of the epoch has closed nominations;
 - all custody traffic carried on the chain (no worker network API);
 - worker lifecycle with relayed one-time-key acknowledgments and releases, and round-driven expiry;
-- an explicit restart policy: custody is lost on restart.
+- an explicit restart policy: custody is lost on restart, because the new process has fresh nomination keys and cannot reopen the on-chain seeds.
 
 Still required:
 - Network-level privacy for chain reads and relayed submissions; key-privacy and selective-opening review of HPKE for nominations.
