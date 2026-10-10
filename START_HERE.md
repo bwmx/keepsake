@@ -64,7 +64,7 @@ No wallet seed or funded account is needed. Tests generate LocalNet throwaway ac
 
 ## Next work
 
-Per-epoch nomination keys are done (2026-10-09). The proposed next track is PAPER_ALIGNMENT_PLAN.md. Phases 0–5 are done (2026-10-09 and 2026-10-10; see the results sections there), and so are Phase 6's erasure and liveness work. Phase 6's TestNet run is next. It needs deployment parameters, funded TestNet accounts, a node per member, and a check of TestNet's app-call argument limits. Separately: wallet integration and browser decryption for Capsule Lab. Before any TestNet step, give each member its own algod node and host and a private network path to it.
+Per-epoch nomination keys are done (2026-10-09). The proposed next track is PAPER_ALIGNMENT_PLAN.md. Phases 0–5 are done (2026-10-09 and 2026-10-10; see the results sections there), and so are Phase 6's erasure and liveness work. Phase 6's TestNet run is next. It needs deployment parameters, funded TestNet accounts and a node per member. TestNet runs the same consensus version as LocalNet (checked 2026-10-10), so Phase 0's measured limits and fees apply. Separately: wallet integration and browser decryption for Capsule Lab. Before any TestNet step, give each member its own algod node and host and a private network path to it.
 
 ## Security boundaries to preserve
 

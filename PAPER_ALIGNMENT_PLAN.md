@@ -314,11 +314,11 @@ In the first run the 6-Algo member came out 2.4 standard deviations low; the nex
 
 **Infrastructure.**
 - **Member CLI.** `node dist/src/epoch-worker.js` runs one member against its own algod node, configured by environment variables. It checks the host before starting. Smoke test: three CLI members, each its own process polling LocalNet, ran three handovers with margin 1 and no errors.
-- **TestNet not started.** It needs four decisions or inputs:
+- **TestNet compatibility (checked 2026-10-10, read-only).** TestNet runs the same consensus version as LocalNet: specs commit `268b634`, on algod 5.0.2 against LocalNet's 5.0.1. So the extended app-call arguments and the per-byte fee measured in Phase 0 apply there too. Fees under congestion are not measured.
+- **TestNet not started.** It needs three decisions or inputs:
   1. deployment parameters: Phase 0 suggests C = 130, t = 50, which needs a bonded population in the thousands for the anonymity assumptions;
   2. funded TestNet accounts for the creator and members, with bonds;
-  3. one node and host per member;
-  4. a check that TestNet's consensus allows the extended app-call arguments (16,384 bytes) and charges the per-byte fee measured on LocalNet algod 5.0.1. If it does not, each call carries about 3 KB, and an epoch needs about 7 times as many calls.
+  3. one node and host per member.
 
 ## Crypto sketch for D2 (review before implementing)
 
