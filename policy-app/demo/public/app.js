@@ -88,7 +88,7 @@ function renderCapsuleList() {
   if (!selected || !state.capsules.some(c => c.id === selected)) selected = state.capsules[0]?.id ?? null;
   view($('capsules')).html = state.capsules.map(c => {
     const i = stageIndex(c), tone = c.opened ? 'ok' : c.refused ? 'warn' : i === 4 ? '' : 'acc';
-    return `<li><button data-capsule="${c.id}" aria-current="${c.id === selected}"><span>Capsule ${c.id}${c.copyOf ? ` · copy of ${c.copyOf}` : ''}</span><span class="pill ${tone}">${c.gone ? 'cleaned up' : STAGES[i]}</span></button></li>`;
+    return `<li><button data-capsule="${c.id}" aria-current="${c.id === selected}"><span>Capsule ${c.id}${c.copyOf ? ` · copy of ${c.copyOf}` : ''}</span><span class="pill ${tone}">${c.gone ? 'cleaned up' : c.refused ? 'refused' : STAGES[i]}</span></button></li>`;
   }).join('');
   $('copy').disabled = !state.capsules.some(c => c.id === selected && !c.copyOf);
 }

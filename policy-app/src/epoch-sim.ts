@@ -57,7 +57,7 @@ export async function deploy(o: { members: number; epochRounds: bigint; nominati
   await algorand.send.payment({ sender: creator, receiver: app.appAddress, amount: microAlgo(100_000) });
   const [enrollDeposit, seatDeposit] = await app.deposits();
   const { genesisHash } = await algorand.client.network();
-  const pins = { genesisHash, appId: app.appId, beaconAppId: 0n, maxRoundAgeMs: 0 };
+  const pins = { genesisHash, appId: app.appId, maxRoundAgeMs: 0 };
   const reader = new EpochReader(algod, pins, params, app.appClient.getABIMethod('postChunk').getSelector());
   const enroll = async (index: number, account: Awaited<ReturnType<typeof fund>>, stake: number) => {
     const vrfSecretKey = vrf.generateKeyPair().secretKey;

@@ -129,7 +129,7 @@ for (const [i, a] of memberAccounts.entries()) {
   await app.send.enroll({ sender: a, args: { vrfKey: vrfKeys[i]!.subarray(32),
     payment: algorand.createTransaction.payment({ sender: a.addr, receiver: app.appAddress, amount: microAlgo(enrollDeposit + algo(BOND).microAlgo) }) } });
 }
-const G = params.genesisCommittee, pins = { genesisHash, appId: app.appId, beaconAppId: 0n, maxRoundAgeMs: 30_000 };
+const G = params.genesisCommittee, pins = { genesisHash, appId: app.appId, maxRoundAgeMs: 30_000 };
 log(`App ${app.appId}: epochs of ${E} rounds (nominations 12, handover 30), t = ${t}, one ticket per member, bonds of ${BOND} Algo. ` +
   `Genesis committee ${G} is nominated from round ${(G - 1n) * E}.`);
 

@@ -239,7 +239,7 @@ Capsule Lab now runs this design (see `policy-app/README.md`). A smoke test thro
 
 **Not done:**
 - **Partial latency.** Releases wait for the next handover, up to an epoch. A faster path would be a documented deviation.
-- **Legacy design still present.** `CapsulePolicy`, `src/sim.ts` and `src/worker.ts` still exist and are tested; Capsule Lab no longer uses them. Removing them is the user's call.
+- **Legacy design still present.** `CapsulePolicy`, `src/sim.ts` and `src/worker.ts` still existed and were tested, but Capsule Lab no longer used them. (Removed 2026-10-10 with the beacon submodule, at the user's request.)
 
 ## Phase 5 results (done 2026-10-10)
 
@@ -456,6 +456,6 @@ Precedents: pairing-based PVSS in SCRAPE (Cascudo and David, 2017), and group-el
 - the relayer for custody traffic;
 - the dependence on a single-operator beacon.
 
-`algorand-hidden-v1` stays until Phase 4 replaces it.
+`algorand-hidden-v1`, the per-capsule design with its beacon and relayer, was removed from `policy-app` on 2026-10-10. The crypto spike's milestone-1 protocol keeps the mode for its own tests.
 
 **Out of scope:** the paper's Appendix A variant (0.38 resilience against a slow adversary, with proofs linear in N) and the paper's MPC/obfuscation applications.

@@ -1,37 +1,33 @@
-# Capsule policy app: hidden, variable-size holder committees (milestones 2–4)
+# Capsule policy app: evolving epoch committees on Algorand
 
-This package contains the Algorand side of [the implementation plan](../IMPLEMENTATION_PLAN.md). It implements steps 1–5 of the plan's "Hidden committee design":
-
-- **Private sortition seeded by our beacon.** Members select themselves privately with their own VRF keys, seeded by our instance of [bwmx/randomness-beacon](https://github.com/bwmx/randomness-beacon) at commit `0e164c3`.
-- **Anonymous one-time holder keys.** Selected members nominate holders without revealing who they are.
-- **Chain-only custody.** Holders interact only through those keys, and only via the chain.
-- **Variable-size committees with a majority threshold.**
+This package is the Algorand side of [the paper alignment plan](../PAPER_ALIGNMENT_PLAN.md). It implements the evolving committees of "Can a Public Blockchain Keep a Secret?" (eprint 2020/464 §3):
+- **Committees.** One committee per epoch, drawn by stake-weighted VRF sortition on Algorand's block seed. Its seats are anonymous until they speak.
+- **Handover.** Each holder posts one handover message per seat (speak once) that re-shares every live bucket key to the next committee.
+- **Capsules.** Capsules are encrypted to the key of the bucket their expiry falls in, and released to their recipient from the handover messages.
 
 | Part | Contents |
 | --- | --- |
-| `smart_contracts/` | `CapsulePolicy`: Algorand TypeScript compiled with Puya TS through AlgoKit |
-| `src/chain.ts` | Chain reader that fails closed; manifest rebuilt from chain data; shared message formats |
-| `src/worker.ts` | Member worker (nominator + holder). Talks only to algod; no network API; also runs as a CLI |
-| `src/sim.ts` | LocalNet environment: beacon + daemon, app, enrolled members, in-process workers, sender/recipient flows |
-| `demo/` | **Capsule Lab**: a local web UI for the epoch-committee design (Phases 4–5) |
-| `smart_contracts/epoch_committee/`, `src/epochs.ts`, `src/epoch-worker.ts`, `src/epoch-capsules.ts`, `src/epoch-sim.ts` | `EpochCommittee`, its member worker, the capsule sender and recipient, and the LocalNet environment: Phases 1–5 of `../PAPER_ALIGNMENT_PLAN.md`, the paper's epoch committees, drawn by stake-weighted sortition, holding bucket keys and releasing capsules (see below) |
-| `smart_contracts/broadcast_probe/`, `bench/broadcast-probe.ts` | Phase 0 probe for `../PAPER_ALIGNMENT_PLAN.md`: argument and note limits and fees, an epoch of handover data posted and rebuilt from blocks, block-seed lookback, stake opcodes (`npm run probe`) |
+| `smart_contracts/epoch_committee/` | `EpochCommittee`: Algorand TypeScript compiled with Puya TS through AlgoKit |
+| `src/epochs.ts` | Round windows, the bucket schedule, sortition tickets, message chunking, and a reader that rebuilds messages from blocks and checks them against the on-chain digests |
+| `src/epoch-worker.ts` | Member worker: keys, nominations, seats, one handover message per seat, verification and cleanup; secrets in per-committee vault processes. Talks only to algod; also runs as a CLI |
+| `src/epoch-capsules.ts` | Capsule sender and recipient, the attested public state, and the liveness margin |
+| `src/epoch-sim.ts` | LocalNet environment: members online with throwaway participation keys, bonded and enrolled; in-process workers |
+| `src/chain.ts` | Chain reader that fails closed, and shared helpers |
+| `demo/` | **Capsule Lab**: a local web UI for the design |
+| `smart_contracts/broadcast_probe/`, `bench/broadcast-probe.ts` | Phase 0 probe: argument and note limits and fees, an epoch of handover data posted and rebuilt from blocks, block-seed lookback, stake opcodes (`npm run probe`) |
 | `bench/testnet-trial.ts` | Phase 6 TestNet trial (`npm run trial`, TestNet only). It funds five throwaway members from `TESTNET_MNEMONIC` in `../.env` (git-ignored) and runs them through a public node. It runs handovers and a capsule round trip, reports timings and fees, then returns what it can to the funder. Keys of an interrupted run are kept in the git-ignored `.testnet-trial.json`; `npm run trial -- cleanup` recovers them |
 
-It runs on **LocalNet only** and is not deployed elsewhere. All cryptography stays in the [crypto spike](../crypto-spike/README.md).
+It runs on LocalNet, and a five-member trial has run on TestNet. All cryptography stays in the [crypto spike](../crypto-spike/README.md). The earlier per-capsule design (`CapsulePolicy`, beacon-seeded slots and a relayer) was removed on 2026-10-10; it is in the Git history before that date.
 
 ## Run
 
-Requires Node.js 24+, AlgoKit CLI 2.10+, Docker, Git and npm. `randomness-beacon/` is a Git submodule pinned to an upstream commit and remains maintained in its upstream repository. The VRF library (`@bwmx/algorand-vrf-utils-ts`) is installed directly from its pinned upstream Git commit. Its upstream prepare step uses pnpm 12.6.0, supplied by the install command below.
+Requires Node.js 24+, AlgoKit CLI 2.10+, Docker, Git and npm. The VRF library (`@bwmx/algorand-vrf-utils-ts`) is installed directly from its pinned upstream Git commit. Its upstream prepare step uses pnpm 12.6.0, supplied by the install command below.
 
 ```sh
-git submodule update --init randomness-beacon
-(cd randomness-beacon \
-  && npx -y pnpm@12.6.0 install --frozen-lockfile && npx -y pnpm@12.6.0 run build:all)
 (cd crypto-spike && npm ci --ignore-scripts)
 cd policy-app && npm exec --yes --package=pnpm@12.6.0 -- npm ci
 algokit localnet start
-npm test        # 13 LocalNet tests, about 6 minutes
+npm test        # 7 LocalNet tests, about 6 minutes
 npm run demo    # Capsule Lab at http://127.0.0.1:8787
 ```
 
@@ -53,55 +49,11 @@ LocalNet must be in its default dev mode, where a block is sealed per transactio
 7. **Operator view.** This toggle shows which seats each member holds and its private worker log, both taken from the workers rather than the chain.
 8. **Committee security.** For the committee in office, it shows the per-epoch chance that a corrupt fraction f exposes the key or stalls a handover, using the exact-tail model from Phase 0.
 
-The clock and the advance button share one queue, so a worker never runs two steps at once. The server binds to 127.0.0.1 only. The recipient's decryption happens inside the server process, standing in for the recipient's own client, and there is no wallet integration. The earlier per-capsule design (`CapsulePolicy`, `src/sim.ts`, `src/worker.ts`) is still in the package and tested, but the demo no longer uses it.
+Checked in headless Chrome on 2026-10-10: the full capsule flow, the operator view, member outages, phone width and dark mode, with no page errors. The clock and the advance button share one queue, so a worker never runs two steps at once. The server binds to 127.0.0.1 only. The recipient's decryption happens inside the server process, standing in for the recipient's own client, and there is no wallet integration.
 
 ## Protocol
 
-| Stage | Step | Who | Authenticated by |
-| --- | --- | --- | --- |
-| — | `admitCustodian(account)`; `enroll(vrfKey)` once | Admin; member | `Txn.sender` |
-| — | `postNominationKey(epoch, key)`: a fresh X25519 key for the current or next epoch (`round / epochRounds`), once per epoch, never replaced. Stored in a ring of 3 per member | Member | `Txn.sender` is enrolled |
-| `AWAITING_SEED` | `register(recipient, openRound, expiresRound, slotCount ≤ 64, minHolders ≥ 3, pay)`. Commits the terms, the registry snapshot and the registration epoch, and requests the beacon seed for `now + 8`. Returns the capsule ID, which is the beacon request ID | Sender | `Txn.sender`; exact payment |
-| `NOMINATING` | Beacon `fulfillRandomness`; then `nominate(capsule, slot, index, proof, holderEncKey, holderSigKey, sealedSeed)` until `seedRound + nominationRounds`. The lowest VRF rank per slot wins | Beacon; eligible member | Caller app is the pinned beacon; `vrf_verify` with the enrolled key; rank below `nominatorThreshold`; `Txn.sender` is the member |
-| `SELECTED` | `closeNominations`. The committee is the filled slots, n ≥ `minHolders`; threshold `⌊n/2⌋ + 1`; empty slots get no fallback | Anyone | — |
-| `DEPOSITING` → `ANCHORED` | `anchorManifest(hash, payloadHash)`, then `postDeposits(slots[], commitments[], deposits[])` in batches of up to 7 until every filled slot has one | Sender | `Txn.sender` |
-| `ACTIVE` | `acknowledgeCustody(capsule, slot, sig)`. Active once acknowledgments reach the threshold; later ones still count | Relayer | `ed25519verify_bare` with the slot's one-time key |
-| | `requestAccess(capsule, hash, requestId, recipientKey)` once, in `[openRound, expiresRound)` | Recipient | `Txn.sender` |
-| | `postRelease(capsule, slot, enc, ct, sig, chainSig)`, once per acknowledged slot, before `expiresRound` | Relayer | One-time key over request ID, recipient key and the release |
-| deleted | After expiry: `deleteSlots(slots[])` in batches of up to 7, then `cleanup`, which refunds the sender. Or `cancelUnseeded` after the beacon's timeout, which refunds everything | Anyone | — |
-
-Nominators seal each holder seed to the chosen member's key for the capsule's registration epoch. Once nominations close, holders find their slots by trying to decrypt each nomination with that epoch's key. Each member erases an epoch's private key as soon as every capsule of that epoch has closed nominations; `createApplication` requires `8 + nominationRounds < epochRounds`, so a ring entry is overwritten only after its epoch's nominations are over. Holders rebuild the manifest from chain data alone and accept their deposit only if it hashes to the anchored value. The recipient does the same and decrypts once a threshold of releases is on-chain. Only the payload ciphertext travels off-chain, and its hash is anchored. The application has no update, delete or opt-in path.
-
-Batching keeps every call within Algorand's limit of 8 resource references per transaction. Each slot is its own box, and counters in the capsule record replace loops over slots.
-
-**Costs on LocalNet (1,000 µAlgo minimum fee):**
-
-- **Registration:** a payment of `137,700 + 176,900 × slots` µAlgo of box deposit, plus 98,200 for the beacon (14,000 fees and 84,200 deposit). For example, 2,358,700 for 12 slots. Cleanup refunds everything except the 14,000 beacon fees.
-- **Each nomination:** 10,000, paid by the nominator (nine budget top-ups for `vrf_verify`).
-- **Nomination keys:** 1,000 per member per epoch, paid by the member. The app account holds 126,500 of box deposit per member (registry, admission and 3 key boxes), pre-funded by the admin.
-- **Each acknowledgment or release:** 4,000, paid by the relayer.
-- **Each deposit batch:** about 3,000.
-- **Leftover:** the beacon's unspent proof-fee share stays in the app.
-
-## Chain behaviour vs the mock ledger
-
-The spike's `MockConfirmedLedger` is still its own test double. Here, every authorization decision comes from chain state:
-
-- **`ChainReader`** pins the genesis hash and app ID. It fails closed on a wrong network, a node that is catching up, a node idle longer than `MAX_ROUND_AGE_MS`, or a missing capsule.
-- **`chainAuthorization`** re-reads the capsule before and after HPKE encryption for each release.
-- **Workers refuse to start** if the app's beacon or their enrolled VRF key differ from their configuration.
-
-Worker config is read from the environment:
-- `ALGOD_SERVER`, `ALGOD_PORT`, `ALGOD_TOKEN`
-- `GENESIS_HASH`, `APP_ID`, `BEACON_APP_ID`
-- `MEMBER_MNEMONIC`, `VRF_SECRET_KEY`, `RELAYER_MNEMONIC` (nomination keys are generated in memory, never configured)
-- `MAX_ROUND_AGE_MS`, `POLL_MS`
-
-Each worker writes JSON event lines to stdout: `ready`, `nominated`, `custody`, `released`, `disposed`, `erased` (an epoch's nomination key). These name the member's own slots and stay private to its operator.
-
-## Epoch committees (paper alignment, Phases 1–5)
-
-`EpochCommittee` is a separate app for the paper's evolving committees (eprint 2020/464 §3). Its workers run it on LocalNet, and capsules are released from its handover messages (Phase 4). Epoch e spans rounds `[e·E, (e+1)·E)`. Committee c is nominated in epoch c − 1 from the block seed of that epoch's first round, and hands over in epoch c.
+`EpochCommittee` implements the paper's evolving committees (eprint 2020/464 §3), and capsules are released from its handover messages (Phase 4). Epoch e spans rounds `[e·E, (e+1)·E)`. Committee c is nominated in epoch c − 1 from the block seed of that epoch's first round, and hands over in epoch c.
 
 **Membership and sortition (Phase 5).** Anyone may join; there is no admin. A member enrolls with a payment that covers its own boxes, and the rest of the payment is its bond.
 - **Weight.** A member's sortition weight is its bond, capped by its online stake (`voter_params_get`, which reads balances 320 rounds back). A bond change counts from the next epoch's nominations, after a seed nobody knew when making it. The bond is escrowed because online stake alone can be counted twice: moving coins between accounts during a nomination window counts them once per account. A withdrawal is paid at once; the coins still count in the current epoch's nominations, and bonded again elsewhere they count only from the next.
@@ -179,18 +131,6 @@ The cryptography lives in [`crypto-spike/src/ecpss.ts`](../crypto-spike/src/ecps
 
 ## Tests
 
-`test/contract.test.ts` (5 tests):
-- **Enrollment and registration:** enrollment rules; nomination keys only for the current or next epoch, never replaced, ring reuse two epochs later, and the epoch-length check; the capsule's registration epoch; committee-size bounds, registry size, payment, and the callback check.
-- **Sortition:** a copied proof, another member's proof and another slot's proof are rejected. The on-chain rank equals the off-chain rank. Lower rank replaces higher without growing the committee. The snapshot, eligibility threshold and deadline are enforced, and too few holders means no fallback.
-- **Variable committee:** 6 of 8 slots give threshold 4. Deposits go in batches, with unfilled, duplicate and oversized batches rejected. Activation happens at the threshold, and late acknowledgments still count. One-time-key signatures are enforced, releases require an acknowledgment, the window and replay rules hold, and batched cleanup refunds exactly.
-- A withheld beacon proof leads to stale cancellation and a full refund.
-- Update, delete and opt-in are rejected.
-
-`test/workers.test.ts` (3 tests):
-- **Step 5 end to end:** 24 members, 16 slots, and an eligibility rate that can leave slots empty. Every slot goes to its lowest-ranked eligible member, and a slot is empty exactly when nobody was eligible. Activation works. Holders are taken offline down to the threshold and recovery still works from chain releases. The indexer shows members sent only `enroll`, `postNominationKey` and `nominate`, and every custody call came from the relayer. A restarted member cannot reopen its slots. Online holders erase the capsule's epoch key while still holding custody. Workers dispose at expiry.
-- **Tampered anchor:** holders refuse custody and the capsule never activates.
-- **Fail-closed reader and CLI:** the chain reader fails closed, and the worker CLI starts only with matching enrolled keys.
-
 `test/epoch-workers.test.ts` (1 test, Phase 3, about 3 minutes): ten member workers, driven in lockstep, run 22 handovers with four outages.
 - **Agreement:** every member, including the ones that were offline, processes every handover, and all agree on each bucket's public key.
 - **No losses:** no bucket is lost, and a bucket's key and reconstructed secret never change.
@@ -225,18 +165,16 @@ The cryptography lives in [`crypto-spike/src/ecpss.ts`](../crypto-spike/src/ecps
 
 ## What is and isn't protected
 
-**Hidden:** which member holds which slot. Holder accounts never sign or pay for anything on-chain.
+**Hidden:** which member holds which seat, until the seat speaks. A seat's holder posts from its own account only after its vault has erased the seat's secrets, as in the paper.
 
 **Not hidden or not guaranteed:**
-
-- **Forward secrecy rests on erasure.** Deposits and sealed holder seeds stay on-chain forever. They stay closed only because each epoch's nomination key exists solely in its worker's memory and is erased once that epoch's nominations close (the paper's per-epoch keys, §2.1 and §3.1.3). Erasure is best effort: the key is a WebCrypto object whose reference is dropped, not provably wiped. Until erasure, and until expiry for the one-time keys and shares, stealing a member's live state exposes what it holds.
-- **Erasure comes after acknowledgment.** The paper erases before a holder posts, because posting reveals the holder. Here the relayer posts, so posting does not name the holder, and the key is erased at the end of its epoch instead.
-- **Restart loses custody.** A restarted member has fresh keys and cannot reopen its seeds; its slots count as offline. Keys it posted before restarting stay on-chain, so seats nominated to it under those keys are lost too.
-- **Nominators are public, and a corrupt nominator owns its slot.** It knows the one-time keys until it erases them. A slot is corrupt with probability about `1 − (1 − f)²` ≈ 2f.
-- **Larger committees are what make hidden selection pay off.** Holders are drawn with replacement, so one member can hold several slots. With n slots and a majority threshold, the chance that colluders control a threshold falls rapidly as n grows, provided 2f stays well below ½ (see Collusion risk in Capsule Lab). Small committees remain weak.
-- **The encryption's anonymity is unreviewed.** HPKE base mode over X25519 is used for nominations without a review of key privacy or selective-opening security against the paper's requirements.
-- **Network-level traffic can still identify holders.** The relayer hides who pays, not which IP queried algod or contacted the relayer.
-- **The beacon seed is public once proven.** Its single operator (us) can learn it early or withhold it.
-- **The admin is the Sybil gate.** Stake weighting (`voter_params_get`) and multi-epoch re-sharing (step 6) are not implemented.
-- **Expiry does not revoke delivered responses,** and memory erasure is best effort.
-- **Status: LocalNet only and unaudited.** Use synthetic secrets only.
+- **The cryptography is unreviewed.** The pairing-based re-sharing, the capsule KEM and their proofs (`crypto-spike/src/pvss.ts`, `ecpss.ts`) have had no cryptographer's review. Plain ElGamal is not known to meet the paper's selective-opening requirement (RIND-SO), and HPKE's anonymity rests on the paper's unproven Conjecture 1.
+- **Committees here are small.** Security needs fewer than t corrupt seats per epoch, and liveness needs t honest seats speaking. The plan's sizes (C ≈ 130–210) come from exact tails at f = 5%. Demo and test committees of 5–20 seats tolerate little corruption.
+- **A seat is corrupt if its nominator or its holder is,** about 2f. Nominators are public and know a seat's keys until they erase them.
+- **Weight is bonded stake.** f is the adversary's share of the bonds, not of Algorand's online stake. The online-stake cap can be worked around by moving online coins between bonded accounts.
+- **Forward secrecy rests on erasure.** Sealed seeds and handover messages stay on-chain forever. Each committee's secrets live in a vault process that exits before its seats speak, but JavaScript cannot wipe bigints or pin memory, so erasure is not provable. Until a vault exits, stealing a member's live state exposes what that vault holds.
+- **One failed handover loses every live bucket.** That happens when fewer than t honest seats speak. Senders can check the liveness margin before locking, but nothing can rescue a bucket once a handover fails.
+- **Network traffic can identify holders.** Members should each use their own node; a shared node sees which account reads what. Each worker trusts its own algod node, since this is not a light client.
+- **Expiry is coarse,** with the granularity of the bucket width plus an epoch. It does not revoke releases already delivered.
+- **Releases wait for the next handover,** up to an epoch.
+- **Status: LocalNet tests and a small TestNet trial only.** Unaudited; use synthetic secrets only.

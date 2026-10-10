@@ -87,20 +87,20 @@ JavaScript/native-library memory copies and garbage collection mean wiping is be
 
 The paper's section 2.3 explicitly defines VRF-based cryptographic sortition. In its construction, sortition selects nominators; those nominators arrange anonymous channels to secret-holding members. Publishing a holding member's own VRF proof reveals that member, so direct public selection does not reproduce the paper's hidden holding committees.
 
-The `CommitteeSelector` returns five explicit descriptors and selection metadata before encryption. This package implements `FixedCommitteeSelector` / `fixed-demo`. `algorand-hidden-v1` is accepted for hidden committees nominated on-chain by `../policy-app`. Their descriptor IDs are `slot-0`…`slot-4`, and the `registryReference` binds the beacon app, request, registry snapshot and randomness into the manifest hash. Holders rebuild the whole manifest from chain data. Other modes are rejected.
+The `CommitteeSelector` returns five explicit descriptors and selection metadata before encryption. This package implements `FixedCommitteeSelector` / `fixed-demo`. `algorand-hidden-v1` is accepted for hidden committees nominated on-chain. Their descriptor IDs are `slot-0`…`slot-4`, and the `registryReference` binds the beacon app, request, registry snapshot and randomness into the manifest hash. Holders rebuild the whole manifest from chain data. Other modes are rejected. The on-chain side of this mode (`CapsulePolicy` in `../policy-app`) was removed on 2026-10-10 in favour of the epoch-committee design.
 
 - **Public beacon:** useful for reproducible public committee selection from a frozen larger registry.
 - **Participant-local VRFs:** useful for private self-selection; require registration, seed/grinding defenses, and proof-disclosure rules.
 - **`vrf_verify` alone:** a verifier, not a generator or secret randomness source. It has an AVM budget cost and suite compatibility requirements.
 
-**Chosen (2026-10-06):** our own instance of [bwmx/randomness-beacon](https://github.com/bwmx/randomness-beacon), a public beacon, integrated in `../policy-app`. None is needed to run this spike. Never use a published VRF value as a secret data key, share, or supposedly private deterministic key seed.
+**Chosen (2026-10-06):** our own instance of [bwmx/randomness-beacon](https://github.com/bwmx/randomness-beacon), a public beacon, for the first on-chain design. **Superseded (2026-10-10):** the epoch design seeds its sortition from Algorand's block seed, and the beacon is no longer used. None is needed to run this spike. Never use a published VRF value as a secret data key, share, or supposedly private deterministic key seed.
 
 ## Next agent's starting point
 
 1. Read `../IMPLEMENTATION_PLAN.md` and `PROTOCOL.md`; run the commands above.
 2. Scaffold the contract with **AlgoKit's Algorand TypeScript / Puya TS tooling**, not Python or TEALScript. Keep these Node crypto modules outside the AVM compilation target.
 3. Done on LocalNet in `../policy-app/`: immutable policy, custody activation, request-key binding and real genesis hash/application ID binding, with contract tests. Remaining: replace mock authorization in custodians with independently verified, fresh chain state (milestone 3).
-4. Done: VRF provider identified (public beacon) and selection implemented on-chain in `../policy-app`. Milestones 2–3 are complete on LocalNet; the next is milestone 4.
+4. Done: VRF provider identified (public beacon) and selection implemented on-chain, then superseded by the epoch-committee design in `../policy-app` (see `../PAPER_ALIGNMENT_PLAN.md`).
 
 ## Sources
 

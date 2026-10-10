@@ -306,8 +306,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   (await SeatVault.start()).close(); // Fails fast where secrets could reach disk (core dumps on, swap unencrypted).
   const pool = new VerifyPool();
   const worker = await startEpochWorker({
-    pins: { genesisHash: required('GENESIS_HASH'), appId: BigInt(required('APP_ID')), beaconAppId: 0n,
-      maxRoundAgeMs: Number(process.env.MAX_ROUND_AGE_MS ?? 30_000) },
+    pins: { genesisHash: required('GENESIS_HASH'), appId: BigInt(required('APP_ID')), maxRoundAgeMs: Number(process.env.MAX_ROUND_AGE_MS ?? 30_000) },
     algod: { server: required('ALGOD_SERVER'), token: process.env.ALGOD_TOKEN ?? '',
       ...(process.env.ALGOD_PORT ? { port: Number(process.env.ALGOD_PORT) } : {}) },
     memberMnemonic: required('MEMBER_MNEMONIC'),

@@ -1,5 +1,7 @@
 # Ephemeral secret capsules on Algorand
 
+> **Status (2026-10-10).** This is the original plan. Its on-chain "Hidden committee design" (beacon-seeded per-capsule committees, a relayer) was built for milestones 2–3. It was then superseded by [PAPER_ALIGNMENT_PLAN.md](PAPER_ALIGNMENT_PLAN.md), the paper's evolving epoch committees, and removed from `policy-app`; it remains in Git history. The goals, stack choice and threat discussion below still apply.
+
 ## Purpose and agreed stack
 
 Build a demonstrable, short-lived secret custody system inspired by [Can a Public Blockchain Keep a Secret?](https://eprint.iacr.org/2020/464.pdf). Algorand records the policy and authorizes access; off-chain custodians hold encrypted key shares. Never put plaintext, plaintext shares, or private keys on-chain.
