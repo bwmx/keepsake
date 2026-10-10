@@ -1,8 +1,8 @@
-import { createPrivateKey, createPublicKey, hkdfSync, sign, type KeyObject } from 'node:crypto';
+import { createHash, createPrivateKey, createPublicKey, hkdfSync, sign, type KeyObject } from 'node:crypto';
 import { bls12_381 as bls } from '@noble/curves/bls12-381.js';
 import { check } from './crypto.js';
 import {
-  ORDER, aggregate, combine, combinePartials, deal, dealingSize, decodeDealing, encapsulate, encodeDealing, lagrange,
+  ORDER, aggregate, combine, combinePartials, deal, dealingSize, decodeDealing, decodeG1, encapsulate, encodeDealing, lagrange,
   partial, point, randomScalar, seatCommitment, validDealings, verifyG1, verifyPartial,
   type Dealing, type G1Point, type G2Point, type Partial, type Proof,
 } from './pvss.js';
@@ -20,8 +20,29 @@ import {
 export type Public = Map<bigint, G1Point[]>;
 /** A holder's private state: its seat, its ephemeral ElGamal scalar and one share per live bucket. */
 export interface Holder { seat: number; x: bigint; shares: Map<bigint, G2Point> }
-/** One holder's handover: a re-sharing per live bucket it holds and a fresh contribution per bucket being created. */
-export interface Message { reshares: Map<bigint, Dealing>; contributions: Map<bigint, Dealing> }
+/**
+ * One holder's handover: a re-sharing per live bucket it holds and a fresh contribution per bucket being created.
+ * Optionally also: per authorized capsule, its decryption partial sealed to the recipient's request key; and its view of
+ * the committee's public state (encodeState), which it attests by signing the digest when it claims its seat.
+ */
+export interface Message {
+  reshares: Map<bigint, Dealing>; contributions: Map<bigint, Dealing>;
+  releases?: Map<bigint, Uint8Array>; state?: Map<bigint, Uint8Array>;
+}
+
+/** A committee's public state on the wire: per bucket, its t polynomial commitments (compressed G1). */
+export const encodeState = (pub: Public) => new Map([...pub].map(([b, poly]) => [b, Buffer.concat(poly.map(p => p.toBytes()))] as const));
+/** What holders attest: SHA-256 over the buckets in order, each as bucket (u64) || commitments. */
+export const stateDigest = (state: Map<bigint, Uint8Array>) => {
+  const h = createHash('sha256').update('ecpss/state/v1');
+  for (const b of [...state.keys()].sort((x, y) => (x < y ? -1 : x > y ? 1 : 0))) h.update(u64(b)).update(state.get(b)!);
+  return h.digest();
+};
+/** Strict decoding of an attested state: t valid, non-identity G1 points per bucket. */
+export const decodeState = (state: Map<bigint, Uint8Array>, t: number): Public => new Map([...state].map(([b, raw]) => {
+  check(raw.length === t * 48, 'Bad state length');
+  return [b, Array.from({ length: t }, (_, l) => decodeG1(raw.subarray(l * 48, (l + 1) * 48)))];
+}));
 
 const u64 = (n: bigint | number) => { const b = Buffer.alloc(8); b.writeBigUInt64BE(BigInt(n)); return b; };
 /** Binds a new-key contribution's proof of knowledge to its committee and bucket (the dealer seat is added by pvss). */
@@ -56,7 +77,7 @@ export function handover(h: Holder, pub: Public, committee: bigint, buckets: { l
 }
 
 export interface Buckets { live: bigint[]; create: bigint[] }
-const dealingsFor = (messages: Map<number, Message>, b: bigint, kind: keyof Message) => {
+const dealingsFor = (messages: Map<number, Message>, b: bigint, kind: 'reshares' | 'contributions') => {
   const seats = [...messages.keys()].sort((x, y) => x - y);
   return seats.map(s => messages.get(s)![kind].get(b)).filter((d, i): d is Dealing => d?.dealer === seats[i]);
 };
@@ -155,32 +176,50 @@ export function openCapsuleKey(poly: G1Point[], u: G1Point, label: Uint8Array, p
   return capsuleKey(combinePartials(valid.map(x => ({ seat: x.seat, d: x.p.d }))), u, label);
 }
 
-// --- Wire format: entry count (u16), then per entry bucket (u64), kind (0 re-share, 1 contribution), dealing ---
+// --- Wire format: entry count (u16), then entries of id (u64), kind, body. Kinds: 0 re-share (bucket, dealing),
+// 1 contribution (bucket, dealing), 2 release (capsule, u16 length, sealed partial), 3 state (bucket, t commitments).
 
+const u16 = (n: number) => { const b = Buffer.alloc(2); b.writeUInt16BE(n); return b; };
 export function encodeMessage(m: Message): Buffer {
-  const entries = [...[...m.reshares].map(([b, d]) => [b, 0, d] as const), ...[...m.contributions].map(([b, d]) => [b, 1, d] as const)];
-  const head = Buffer.alloc(2);
-  head.writeUInt16BE(entries.length);
-  return Buffer.concat([head, ...entries.flatMap(([b, kind, d]) => [u64(b), Buffer.from([kind]), encodeDealing(d)])]);
+  const entries = [
+    ...[...m.reshares].map(([b, d]) => [b, 0, encodeDealing(d)] as const),
+    ...[...m.contributions].map(([b, d]) => [b, 1, encodeDealing(d)] as const),
+    ...[...m.releases ?? []].map(([c, sealed]) => [c, 2, Buffer.concat([u16(sealed.length), sealed])] as const),
+    ...[...m.state ?? []].map(([b, raw]) => [b, 3, Buffer.from(raw)] as const),
+  ];
+  return Buffer.concat([u16(entries.length), ...entries.flatMap(([id, kind, body]) => [u64(id), Buffer.from([kind]), body])]);
 }
 
-/** Strict decoding of an untrusted message posted for `seat`; n is the next committee's size. `keep`: see decodeDealing. */
-export function decodeMessage(bytes: Uint8Array, seat: number, n: number, t: number, keep?: number[]): Message {
+/** A message's entries without decoding any point: kind, id (bucket or capsule) and body, with every length checked. */
+export function messageEntries(bytes: Uint8Array, n: number, t: number) {
   const buf = Buffer.from(bytes);
   check(buf.length >= 2, 'Truncated message');
-  const m: Message = { reshares: new Map(), contributions: new Map() };
+  const entries: { kind: number; id: bigint; body: Buffer }[] = [], seen = new Set<string>();
   let at = 2;
   for (let i = 0; i < buf.readUInt16BE(0); i++) {
     check(buf.length >= at + 9, 'Truncated message');
-    const bucket = buf.readBigUInt64BE(at), kind = buf[at + 8];
-    check(kind === 0 || kind === 1, 'Unknown entry kind');
-    const target = kind === 0 ? m.reshares : m.contributions;
-    check(!target.has(bucket), 'Duplicate entry');
-    const size = dealingSize(n, t, kind === 1);
-    check(buf.length >= at + 9 + size, 'Truncated message');
-    target.set(bucket, decodeDealing(buf.subarray(at + 9, at + 9 + size), seat, n, t, kind === 1, keep));
-    at += 9 + size;
+    const id = buf.readBigUInt64BE(at), kind = buf[at + 8]!;
+    at += 9;
+    check(kind <= 3, 'Unknown entry kind');
+    check(!seen.has(`${kind}:${id}`), 'Duplicate entry');
+    seen.add(`${kind}:${id}`);
+    if (kind === 2) check(buf.length >= at + 2, 'Truncated message');
+    const size = kind <= 1 ? dealingSize(n, t, kind === 1) : kind === 2 ? 2 + buf.readUInt16BE(at) : t * 48;
+    check(buf.length >= at + size, 'Truncated message');
+    entries.push({ kind, id, body: kind === 2 ? buf.subarray(at + 2, at + size) : buf.subarray(at, at + size) });
+    at += size;
   }
   check(at === buf.length, 'Trailing bytes');
+  return entries;
+}
+
+/** Strict decoding of an untrusted message posted for `seat`; n is the next committee's size. `keep`: see decodeDealing. */
+export function decodeMessage(bytes: Uint8Array, seat: number, n: number, t: number, keep?: number[]): Required<Message> {
+  const m = { reshares: new Map(), contributions: new Map(), releases: new Map(), state: new Map() } as Required<Message>;
+  for (const { kind, id, body } of messageEntries(bytes, n, t)) {
+    if (kind <= 1) (kind === 0 ? m.reshares : m.contributions).set(id, decodeDealing(body, seat, n, t, kind === 1, keep));
+    // Releases are opened only by their recipient, and a state only once it is attested: both stay raw here.
+    else (kind === 2 ? m.releases : m.state).set(id, body);
+  }
   return m;
 }

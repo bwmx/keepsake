@@ -1,6 +1,6 @@
 import {
-  Account, BoxMap, Bytes, Contract, Global, GlobalState, OpUpFeeSource, Txn, VrfVerify, abimethod, assert, clone,
-  ensureBudget, op, readonly, type bytes, type uint64,
+  Account, BoxMap, Bytes, Contract, Global, GlobalState, OpUpFeeSource, Txn, VrfVerify, abimethod, arc4, assert, clone,
+  ensureBudget, gtxn, itxn, op, readonly, type bytes, type uint64,
 } from '@algorandfoundation/algorand-typescript'
 
 const VRF_BUDGET: uint64 = 6_300 // vrf_verify costs 5,700.
@@ -23,8 +23,25 @@ export type Seat = {
   sealedSeed: bytes<80> // HPKE(enc 32 || ct 48) of the seed behind both keys, to the nominee's epoch key.
   holder: Account // Zero until claimed: the account that posts this seat's handover message.
   digest: bytes<32> // Running SHA-256 over the message chunks, rebuilt by readers from block data.
+  stateDigest: bytes<32> // Signed at the claim: the committee's public state as this holder received it.
   chunks: uint64
   finalized: boolean
+}
+
+// A capsule under bucket expiresRound / bucketRounds (Phase 4). Its key is the bucket key, used through a KEM: the
+// committee in office releases decryption partials, sealed to the recipient's request key, in its handover messages.
+export type CapsuleRecord = {
+  sender: Account
+  recipient: Account
+  openRound: uint64
+  expiresRound: uint64
+  bucket: uint64
+  u: bytes<48> // The KEM's r·g1.
+  proof: bytes<64> // Proof of r bound to the capsule's label; holders refuse a u copied under another policy.
+  payloadHash: bytes<32> // The payload ciphertext stays off-chain.
+  requested: boolean
+  requestId: bytes<16>
+  recipientKey: bytes<32> // The recipient's fresh X25519 request key.
 }
 
 /**
@@ -53,6 +70,8 @@ export class EpochCommittee extends Contract {
   nominationKeys = BoxMap<bytes, EpochKey>({ keyPrefix: 'k' }) // Key: itob(index) || itob(epoch % 3).
   committees = BoxMap<uint64, Committee>({ keyPrefix: 'c' })
   seats = BoxMap<bytes, Seat>({ keyPrefix: 'n' }) // Key: itob(committee) || itob(nominator index).
+  capsuleCount = GlobalState<uint64>({ key: 'capsuleCount', initialValue: 0 })
+  capsules = BoxMap<uint64, CapsuleRecord>({ keyPrefix: 'x' })
 
   @abimethod({ onCreate: 'require' })
   createApplication(
@@ -130,23 +149,28 @@ export class EpochCommittee extends Contract {
     const [output, verified] = op.vrfVerify(VrfVerify.VrfAlgorand, alpha, proof, member.vrfKey)
     assert(verified, 'Invalid VRF proof')
     assert(op.btoi(op.extract(output, 0, 8)) < this.nominatorThreshold.value, 'Not eligible')
-    seat.value = { epk, sigKey, sealedSeed, holder: Global.zeroAddress, digest: Bytes<32>({ length: 32 }), chunks: 0, finalized: false }
+    seat.value = {
+      epk, sigKey, sealedSeed, holder: Global.zeroAddress, digest: Bytes<32>({ length: 32 }),
+      stateDigest: Bytes<32>({ length: 32 }), chunks: 0, finalized: false,
+    }
     const record = this.committees(committee)
     record.value.seats += 1
   }
 
   /**
    * A holder takes its seat for the handover window of epoch `committee`: the seat's one-time key signs
-   * "ecpss/claim/v1" || appId || committee || nominator || holder. Only that account may then post the message.
+   * "ecpss/claim/v1" || appId || committee || nominator || holder || stateDigest. Only that account may then post the
+   * message. Readers trust a public state that t seats attest: fewer than t are corrupt.
    */
-  claim(committee: uint64, nominator: uint64, holder: Account, signature: bytes<64>): void {
+  claim(committee: uint64, nominator: uint64, holder: Account, stateDigest: bytes<32>, signature: bytes<64>): void {
     const seat = this.openSeat(committee, nominator)
     assert(seat.value.holder === Global.zeroAddress, 'Already claimed')
     ensureBudget(SIG_BUDGET, OpUpFeeSource.GroupCredit)
     const message = Bytes('ecpss/claim/v1').concat(op.itob(Global.currentApplicationId.id)).concat(op.itob(committee))
-      .concat(op.itob(nominator)).concat(holder.bytes)
+      .concat(op.itob(nominator)).concat(holder.bytes).concat(stateDigest)
     assert(op.ed25519verifyBare(message, signature, seat.value.sigKey), 'Invalid seat signature')
     seat.value.holder = holder
+    seat.value.stateDigest = stateDigest
   }
 
   /** Appends one chunk (four argument parts plus the note) to the seat's running digest. */
@@ -184,6 +208,52 @@ export class EpochCommittee extends Contract {
     this.committees(committee).delete()
   }
 
+  /**
+   * Registers a capsule under bucket expiresRound / bucketRounds, which must exist by schedule. The window spans at
+   * least two epochs, so a handover falls inside it after any request. The sender pays the box deposit exactly.
+   */
+  registerCapsule(recipient: Account, openRound: uint64, expiresRound: uint64, u: bytes<48>, proof: bytes<64>,
+    payloadHash: bytes<32>, payment: gtxn.PaymentTxn): uint64 {
+    const E = this.epochRounds.value
+    const epoch: uint64 = Global.round / E
+    assert(epoch > this.genesisCommittee.value, 'No buckets yet')
+    assert(Global.round <= openRound && openRound < expiresRound && expiresRound - openRound >= 2 * E, 'Invalid window')
+    const bucket: uint64 = expiresRound / this.bucketRounds.value
+    assert(bucket * this.bucketRounds.value < (epoch + 1) * E + this.bucketLead.value, 'Bucket not created yet')
+    assert(payment.receiver === Global.currentApplicationAddress && payment.amount === this.capsuleMbr(), 'Exact payment required')
+    const id = this.capsuleCount.value
+    this.capsules(id).value = {
+      sender: Txn.sender, recipient, openRound, expiresRound, bucket, u, proof, payloadHash, requested: false,
+      requestId: Bytes<16>({ length: 16 }), recipientKey: Bytes<32>({ length: 32 }),
+    }
+    this.capsuleCount.value = id + 1
+    return id
+  }
+
+  /** The recipient binds one fresh request key inside [openRound, expiresRound). */
+  requestAccess(capsuleId: uint64, requestId: bytes<16>, recipientKey: bytes<32>): void {
+    const capsule = this.capsules(capsuleId)
+    assert(Txn.sender === capsule.value.recipient, 'Not recipient')
+    assert(Global.round >= capsule.value.openRound, 'Not open')
+    assert(Global.round < capsule.value.expiresRound, 'Expired')
+    assert(!capsule.value.requested, 'Already requested')
+    capsule.value.requested = true
+    capsule.value.requestId = requestId
+    capsule.value.recipientKey = recipientKey
+  }
+
+  /** Anyone, after expiry: deletes the record and refunds the sender's deposit. */
+  deleteCapsule(capsuleId: uint64): void {
+    const record = clone(this.capsules(capsuleId).value)
+    assert(Global.round >= record.expiresRound, 'Not expired')
+    this.capsules(capsuleId).delete()
+    itxn.payment({ receiver: record.sender, amount: this.capsuleMbr(), fee: 0 }).submit()
+  }
+
+  private capsuleMbr(): uint64 {
+    return 2_500 + 400 * (this.capsules.keyPrefix.length + 8 + arc4.sizeOf<CapsuleRecord>())
+  }
+
   private seedOf(committee: uint64): bytes<32> {
     assert(committee > 0, 'No committee 0')
     const record = this.committees(committee)
@@ -208,6 +278,11 @@ export class EpochCommittee extends Contract {
   @readonly
   getCommittee(committee: uint64): Committee {
     return this.committees(committee).value
+  }
+
+  @readonly
+  getCapsule(capsuleId: uint64): CapsuleRecord {
+    return this.capsules(capsuleId).value
   }
 
   @readonly

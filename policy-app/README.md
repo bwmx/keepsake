@@ -13,8 +13,8 @@ This package contains the Algorand side of [the implementation plan](../IMPLEMEN
 | `src/chain.ts` | Chain reader that fails closed; manifest rebuilt from chain data; shared message formats |
 | `src/worker.ts` | Member worker (nominator + holder). Talks only to algod; no network API; also runs as a CLI |
 | `src/sim.ts` | LocalNet environment: beacon + daemon, app, enrolled members, in-process workers, sender/recipient flows |
-| `demo/` | **Capsule Lab**: a local web UI that drives all of the above |
-| `smart_contracts/epoch_committee/`, `src/epochs.ts`, `src/epoch-worker.ts` | `EpochCommittee` and its member worker: Phases 1–3 of `../PAPER_ALIGNMENT_PLAN.md`, the paper's epoch committees holding bucket keys (see below). Not yet used by capsules |
+| `demo/` | **Capsule Lab**: a local web UI for the epoch-committee design (Phase 4) |
+| `smart_contracts/epoch_committee/`, `src/epochs.ts`, `src/epoch-worker.ts`, `src/epoch-capsules.ts`, `src/epoch-sim.ts` | `EpochCommittee`, its member worker, the capsule sender and recipient, and the LocalNet environment: Phases 1–4 of `../PAPER_ALIGNMENT_PLAN.md`, the paper's epoch committees holding bucket keys and releasing capsules (see below) |
 | `smart_contracts/broadcast_probe/`, `bench/broadcast-probe.ts` | Phase 0 probe for `../PAPER_ALIGNMENT_PLAN.md`: argument and note limits and fees, an epoch of handover data posted and rebuilt from blocks, block-seed lookback, stake opcodes (`npm run probe`) |
 
 It runs on **LocalNet only** and is not deployed elsewhere. All cryptography stays in the [crypto spike](../crypto-spike/README.md).
@@ -30,7 +30,7 @@ git submodule update --init randomness-beacon
 (cd crypto-spike && npm ci --ignore-scripts)
 cd policy-app && npm exec --yes --package=pnpm@12.6.0 -- npm ci
 algokit localnet start
-npm test        # 12 LocalNet tests, about 5 minutes
+npm test        # 13 LocalNet tests, about 6 minutes
 npm run demo    # Capsule Lab at http://127.0.0.1:8787
 ```
 
@@ -38,26 +38,21 @@ LocalNet must be in its default dev mode, where a block is sealed per transactio
 
 ## Capsule Lab (demo UI)
 
-`npm run demo` serves a single page at `127.0.0.1:8787`. One local server plays every party; in a real deployment each would run its own client and each member its own node. What you can do:
+`npm run demo` serves a single page at `127.0.0.1:8787` for the paper-aligned design: `EpochCommittee` with its member workers, with capsules on bucket keys. One local server plays every party, and the workers step in lockstep with the round clock. In a real deployment each member, sender and recipient would run its own client and node. What you can do:
 
-1. **Start an environment.** Choose the number of members, the nomination window and the expected eligible members per slot. This deploys a fresh beacon with its own VRF key and daemon, plus the policy app, then enrolls the members and starts their workers.
-2. **Lock a capsule.** Pick the slot count and minimum committee. Then watch each stage:
-   - the beacon seed;
-   - private sortition: slots fill with VRF ranks and public nominators, and some may stay empty;
-   - the committee and threshold;
-   - deposits;
-   - holders' acknowledgments, which arrive through the relayer.
-3. **Operator view.** This toggle reveals who actually holds each slot, taken from the workers' private logs, which are not on-chain. Turn it off to see only what the chain shows.
-4. **Play the recipient.** The clock pauses automatically when the access window opens. Request access, then collect releases and decrypt; this works with members offline as long as a threshold remains. You can also try:
-   - requesting early;
-   - requesting from another wallet;
-   - requesting again with a new key;
-   - requesting after expiry.
-5. **Members.** Click one to take it offline or bring it back. A returning member does not regain its slots: its nomination keys lived only in the stopped process.
-6. **Tamper scenario.** The sender anchors a hash that doesn't match the chain data. Holders refuse custody and the capsule never activates.
-7. **Collusion risk.** For the committee shown, compare the probability that colluders control a threshold of slots under hidden selection versus the earlier public draw.
+1. **Start an environment.** Choose the number of members, the expected committee size and the threshold t. This deploys the app, enrolls the members and starts their workers. The genesis committee creates the first buckets, and their keys are attested about two epochs later.
+2. **Watch the epochs.** The epoch panel shows the nomination window and the handover window, the committee in office, the messages posted, and recent handovers: messages checked, buckets held with their public keys, and whether all members agree.
+3. **Lock a capsule.** The sender encrypts under the key of the bucket its expiry falls in, taken from the state the committee attested. It registers u, a proof bound to the policy, and the payload hash. There is no dealer and no per-capsule committee.
+4. **Play the recipient.**
+   - Request access with a fresh key.
+   - At the next handover every holder seals a partial to that key. The recipient checks the partials against the attested commitments and decrypts.
+   - You can also try requesting early, from another wallet, again with a new key, or after expiry.
+5. **Replay attack.** Copy a capsule's u under another policy. Every holder refuses it, because its proof is bound to the original policy.
+6. **Members.** Take members offline (an outage: they keep their memory and catch up when back). A committee hands over as long as t of its seats post.
+7. **Operator view.** This toggle shows which seats each member holds and its private worker log, both taken from the workers rather than the chain.
+8. **Committee security.** For the committee in office, it shows the per-epoch chance that a corrupt fraction f exposes the key or stalls a handover, using the exact-tail model from Phase 0.
 
-The server binds to 127.0.0.1 only. The recipient's decryption happens inside the server process, standing in for the recipient's own client, and there is no wallet integration.
+The server binds to 127.0.0.1 only. The recipient's decryption happens inside the server process, standing in for the recipient's own client, and there is no wallet integration. The earlier per-capsule design (`CapsulePolicy`, `src/sim.ts`, `src/worker.ts`) is still in the package and tested, but the demo no longer uses it.
 
 ## Protocol
 
@@ -103,9 +98,9 @@ Worker config is read from the environment:
 
 Each worker writes JSON event lines to stdout: `ready`, `nominated`, `custody`, `released`, `disposed`, `erased` (an epoch's nomination key). These name the member's own slots and stay private to its operator.
 
-## Epoch committees (paper alignment, Phases 1–3)
+## Epoch committees (paper alignment, Phases 1–4)
 
-`EpochCommittee` is a separate app for the paper's evolving committees (eprint 2020/464 §3). Its workers run it on LocalNet; capsules don't use it yet (Phase 4). Epoch e spans rounds `[e·E, (e+1)·E)`. Committee c is nominated in epoch c − 1 from the block seed of that epoch's first round, and hands over in epoch c.
+`EpochCommittee` is a separate app for the paper's evolving committees (eprint 2020/464 §3). Its workers run it on LocalNet, and capsules are released from its handover messages (Phase 4). Epoch e spans rounds `[e·E, (e+1)·E)`. Committee c is nominated in epoch c − 1 from the block seed of that epoch's first round, and hands over in epoch c.
 
 | Rounds of epoch e | Call | Who | Checks |
 | --- | --- | --- | --- |
@@ -113,6 +108,9 @@ Each worker writes JSON event lines to stdout: `ready`, `nominated`, `custody`, 
 | 1…`nominationRounds` | `captureSeed(e + 1)` (also done by the first nomination); `nominate(index, proof, epk, sigKey, sealedSeed)`, once per member, for committee e + 1 | Anyone; eligible member | The seed is read with `block BlkSeed` under a short validity window. `vrf_verify` over `sha256("ecpss/nominate/v1" ‖ appId ‖ committee ‖ seed)` with the enrolled key, rank below the threshold, member enrolled before the seed round |
 | Next `handoverRounds` | `claim(e, nominator, holder, sig)`, then `postChunk(e, nominator, a, b, c, d)` with the note, then `finalize` | Committee e's holders | The seat's one-time Ed25519 key signs the claim; after that, `Txn.sender` must be the claimed holder. Each chunk is folded into the seat's on-chain running digest |
 | After epoch e | `deleteSeats(e, nominators[])` (batches of 7), then `deleteCommittee(e)` | Anyone (workers take turns, three committees back) | — |
+| Any (from committee genesis + 1) | `registerCapsule(recipient, openRound, expiresRound, u, proof, payloadHash, pay)` under bucket `expiresRound / bucketRounds`, which must exist by schedule; the window must span ≥ 2 epochs | Sender | Exact payment of the 118,500 µAlgo box deposit |
+| `[openRound, expiresRound)` | `requestAccess(capsule, requestId, recipientKey)` once | Recipient | `Txn.sender` |
+| After `expiresRound` | `deleteCapsule(capsule)` refunds the deposit | Anyone | — |
 
 `createApplication` also fixes the parameters every member must agree on:
 - the sharing threshold t;
@@ -127,6 +125,12 @@ The member worker ([`src/epoch-worker.ts`](src/epoch-worker.ts)) handles each ep
 - **Processing.** It processes every closed handover in order and catches up after an outage. Messages are verified on a shared thread pool (`VerifyPool` from the crypto spike), and it combines shares for its seats in the next committee.
 
 Secrets live only in memory. A restarted member would need to replay every handover since genesis from an archival node, which is not implemented.
+
+**Capsules (Phase 4).** A holder's handover message also carries:
+- a decryption partial, sealed to the recipient's request key, for each capsule that is requested, still open, and under a bucket it holds;
+- its view of the committee's public commitments, whose digest it signs when it claims its seat.
+
+Senders and recipients take the state that at least t seats attest, so at least one honest seat agrees with it ([`src/epoch-capsules.ts`](src/epoch-capsules.ts)). Senders get a bucket's public key from it, and recipients check partials against it. A holder refuses a capsule whose proof is bound to another policy. A bucket must be created and attested before senders need it, so `bucketLead` must cover the capsule horizon plus about two epochs.
 
 Off-chain, [`src/epochs.ts`](src/epochs.ts):
 - orders seats by their one-time signing key and drops any seat whose keys repeat another's;
@@ -155,6 +159,13 @@ The cryptography lives in [`crypto-spike/src/ecpss.ts`](../crypto-spike/src/ecps
 - **Schedule:** buckets appear and disappear exactly as scheduled.
 - **Indexer:** each seat's claim and finalize happen once, from its own holder (a member, never a relayer), after that member posted its key for the next epoch. Nobody speaks while offline.
 - **Cleanup:** old committees are deleted, and workers report no errors.
+
+`test/epoch-capsules.test.ts` (1 test, Phase 4, about 80 seconds): with eight member workers running, it shows:
+- a capsule locked under an attested bucket key is privately released at the next handover and decrypts;
+- requests are refused from another wallet, before opening, for a second key and after expiry;
+- a capsule reusing another's u under its own policy is refused by every holder, without errors;
+- the deposit is refunded;
+- after its last handover the expired capsule's bucket is held by nobody and re-dealt by nobody.
 
 `test/epochs.test.ts` (3 tests, Phases 1–2):
 - **Sortition:** the captured seed equals the block's seed. Exactly the VRF-eligible members nominate, once each. Ineligible, late-enrolled, copied-proof, duplicate and out-of-window nominations are rejected. Seats are numbered in signing-key order and each opens only for its nominee.

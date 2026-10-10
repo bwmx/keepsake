@@ -71,6 +71,10 @@
   .fact { background: var(--faint); border-radius: 8px; padding: 8px 10px; }
   .fact b { display: block; font-size: 18px; font-variant-numeric: tabular-nums; }
   .fact span { color: var(--muted); font-size: 11px; }
+  table.hist { width: 100%; border-collapse: collapse; font-size: 12px; }
+  table.hist td, table.hist th { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--faint); }
+  table.hist th { color: var(--muted); font-weight: 600; }
+  .hand { position: absolute; top: 14px; height: 6px; background: var(--priv-soft); border: 1px solid var(--priv); border-radius: 3px; }
   .slots { display: grid; grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); gap: 8px; }
   .slot { border: 1px solid var(--border); border-radius: 10px; padding: 8px; font-size: 12px; background: var(--panel); }
   .slot.empty { border-style: dashed; color: var(--muted); }
@@ -118,9 +122,10 @@
   <div class="row" id="clockControls" hidden>
     <button id="play" aria-label="Pause the round clock">Pause</button>
     <select id="rate" aria-label="Round clock speed">
-      <option value="1">1 round/s</option><option value="2">2 rounds/s</option><option value="5">5 rounds/s</option>
+      <option value="2">2 rounds/s</option><option value="4">4 rounds/s</option><option value="8">8 rounds/s</option>
     </select>
     <button data-advance="10">+10 rounds</button>
+    <button data-advance="80">+1 epoch</button>
   </div>
   <label class="row" style="color:var(--priv);font-size:13px"><input type="checkbox" id="god" aria-label="Operator view: show private worker logs"> Operator view</label>
 </header>
@@ -128,15 +133,18 @@
 <main>
   <section id="setup" class="card" hidden>
     <h3>Set up a LocalNet environment</h3>
-    <p>This deploys a fresh copy of the randomness beacon with its own VRF key and runs the beacon's daemon. It also deploys the capsule
-      policy app and enrolls registry members, each with its own VRF key, then starts a worker for each member. Workers post a fresh nomination key every epoch.
-      All accounts are LocalNet throwaways. One local server plays every party so you can watch the whole protocol.</p>
+    <p>This deploys the EpochCommittee app, which implements the paper's evolving committees (eprint 2020/464 §3), and enrolls
+      registry members, then runs a worker for each. Every epoch, members privately win VRF sortition on the block seed and nominate
+      the next committee's anonymous seats. Then each holder of the current committee posts one handover message from its own account:
+      re-sharings of every bucket key, contributions to new buckets, and decryption partials for capsules. Then it erases everything.
+      Capsules are locked under the key of the bucket their expiry falls in. All accounts are LocalNet throwaways.</p>
     <div class="grid2">
-      <div><label for="sMembers">Registry members</label><input id="sMembers" type="number" min="6" max="40" value="16"></div>
-      <div><label for="sRounds">Nomination window (rounds)</label><input id="sRounds" type="number" min="10" max="100" value="40"></div>
-      <div><label for="sPerSlot">Expected eligible members per slot</label><input id="sPerSlot" type="number" min="1" max="40" step="0.5" value="2.5"></div>
+      <div><label for="sMembers">Registry members</label><input id="sMembers" type="number" min="4" max="16" value="10"></div>
+      <div><label for="sCommittee">Expected committee size</label><input id="sCommittee" type="number" min="3" max="16" value="10"></div>
+      <div><label for="sT">Threshold t</label><input id="sT" type="number" min="1" max="10" value="3"></div>
     </div>
-    <p class="note">Fewer eligible members per slot keeps nominations private but leaves more slots empty, so the committee size varies.</p>
+    <p class="note">Any t seats of a committee can use a bucket key; fewer cannot. A committee also needs t honest seats online to hand over,
+      or its buckets are lost. Epochs are 80 rounds: nominations, then handover, then verification.</p>
     <div class="row" style="margin-top:12px"><button class="primary" id="start">Start environment</button><span id="startStatus" class="note"></span></div>
   </section>
 
@@ -147,33 +155,36 @@
         <label for="message">Secret message (synthetic)</label>
         <textarea id="message">Sealed bid: 4,250 ALGO for lot 17</textarea>
         <div class="grid2" style="margin-top:8px">
-          <div><label for="slots">Holder slots</label><input id="slots" type="number" min="3" max="64" value="9"></div>
-          <div><label for="minHolders">Minimum committee</label><input id="minHolders" type="number" min="3" max="64" value="5"></div>
-          <div><label for="openIn">Opens after deadline (rounds)</label><input id="openIn" type="number" min="5" max="200" value="15"></div>
-          <div><label for="length">Window length (rounds)</label><input id="length" type="number" min="2" max="300" value="60"></div>
+          <div><label for="openIn">Opens in (rounds)</label><input id="openIn" type="number" min="0" max="300" value="10"></div>
+          <div><label for="length">Window length (rounds, ≥ 160)</label><input id="length" type="number" min="160" max="800" value="240"></div>
         </div>
-        <label class="check" style="margin-top:8px"><input type="checkbox" id="tamper" aria-label="Tamper: anchor a mismatched hash"><span>Tamper: anchor a hash that doesn't match the chain data</span></label>
         <button class="primary" id="lock" style="margin-top:10px;width:100%">Lock capsule</button>
-        <p class="note">Commits the terms, freezes the registry snapshot and requests the beacon seed for a future round, all in one transaction.</p>
+        <p class="note">Encrypts locally under the key of the bucket its expiry falls in, taken from the state the committee attested, and
+          registers u, a proof bound to this policy, and the payload hash. No dealer, no per-capsule committee.</p>
       </div>
-      <div class="card"><h2>Capsules</h2><ul class="plain" id="capsules"></ul><p class="note" id="noCapsules">None yet.</p></div>
+      <div class="card">
+        <h2>Capsules</h2><ul class="plain" id="capsules"></ul><p class="note" id="noCapsules">None yet.</p>
+        <button id="copy" class="danger" style="width:100%;margin-top:6px">Replay: copy the selected capsule's u under another policy</button>
+      </div>
     </div>
 
     <div class="col">
+      <div class="card">
+        <div class="row" style="justify-content:space-between"><h3 id="eTitle"></h3><span id="ePhase" class="pill acc"></span></div>
+        <div class="timeline" id="eTimeline"></div>
+        <div class="explain" id="eExplain"></div>
+        <div class="facts" id="eFacts"></div>
+        <h2 style="margin-top:12px">Recent handovers</h2>
+        <div id="history"></div>
+      </div>
       <div class="card" id="capsuleCard">
-        <p class="note" id="pickCapsule">Lock a capsule to start.</p>
+        <p class="note" id="pickCapsule">Lock a capsule to start. Its bucket's key must be attested first: let the clock run a few epochs.</p>
         <div id="capsuleBody" hidden>
           <div class="row" style="justify-content:space-between"><h3 id="cTitle"></h3><span id="cStatus" class="pill"></span></div>
           <ol class="stepper" id="stepper"></ol>
           <div class="timeline" id="timeline"></div>
           <div class="explain" id="explain"></div>
           <div class="facts" id="facts"></div>
-          <div class="slots" id="slotGrid"></div>
-          <div class="legend">
-            <span><span class="chip on d">D</span> deposit posted</span><span><span class="chip on a">A</span> holder acknowledged</span>
-            <span><span class="chip on r">R</span> share released</span><span>Bar: VRF rank of the winning nominator (shorter wins)</span>
-            <span class="priv-note" id="godLegend" hidden>Purple: who actually holds each slot, from operator logs; not on-chain</span>
-          </div>
         </div>
       </div>
       <div class="card"><h2>Activity</h2><ol id="log" aria-live="polite"></ol></div>
@@ -184,23 +195,24 @@
         <h2>Recipient</h2>
         <div class="actions">
           <button class="primary" id="request">Request access with a fresh key</button>
-          <button id="recover">Collect releases and decrypt</button>
+          <button id="open">Collect partials and decrypt</button>
           <button id="wrongWallet" class="danger">Try: request from another wallet</button>
           <button id="cleanup">Clean up expired capsule</button>
         </div>
         <div id="recResult"></div>
-        <p class="note">The recipient's one-time X25519 key is bound on-chain once. Holders encrypt shares only to that key. Requesting again or from another wallet is rejected.</p>
+        <p class="note">The recipient binds one fresh X25519 key on-chain. At the next handover each holder seals its partial to that key. The
+          recipient checks the partials against the attested commitments, needs t of them, and decrypts locally.</p>
       </div>
       <div class="card">
         <h2>Members</h2>
         <div id="members"></div>
-        <p class="note">Click a member to take it offline or bring it back. A member that returns does not regain its slots:
-          its nomination keys lived only in the stopped process, one per epoch, so the on-chain seeds sealed to them stay closed.</p>
+        <p class="note">Click a member to take it offline or bring it back (an outage: it keeps its memory, its seats stay silent, and it
+          catches up when back). A committee hands over as long as t of its seats post.</p>
       </div>
       <div class="card risk">
-        <h2>Collusion risk</h2>
-        <label for="corrupt">Corrupt fraction of members: <output id="fOut">10%</output></label>
-        <input id="corrupt" type="range" min="0" max="50" value="10" style="width:100%">
+        <h2>Committee security</h2>
+        <label for="corrupt">Corrupt fraction of members: <output id="fOut">5%</output></label>
+        <input id="corrupt" type="range" min="0" max="40" value="5" style="width:100%">
         <div class="bars" id="riskBars"></div>
         <p class="note" id="riskNote"></p>
       </div>

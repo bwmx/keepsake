@@ -1,49 +1,50 @@
+import { randomBytes } from 'node:crypto';
 import { createServer, type ServerResponse } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
-import type { AccessRequest, Capsule } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/protocol.js';
-import { STAGE, slotRange } from '../src/chain.js';
-import { ANY_RANK, LocalNetSim } from '../src/sim.js';
+import { microAlgo } from '@algorandfoundation/algokit-utils';
+import { generateEphemeralKey, type EncryptedPayload } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/crypto.js';
+import { VerifyPool } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/parallel.js';
+import { CAPSULE_DEPOSIT, bucketKey, capsuleLabel, openCapsule, sealCapsule } from '../src/epoch-capsules.js';
+import { windows } from '../src/epochs.js';
+import { algorand, deploy, lastRound, startWorkers, stepAll, type Env, type WorkerEvent, type Workers } from '../src/epoch-sim.js';
 
 /**
- * LOCALNET DEMO SERVER. Plays every party with throwaway accounts and serves the control-room UI on 127.0.0.1.
- * In a real deployment the sender, recipient and each member run their own clients; here one process hosts them.
+ * LOCALNET DEMO SERVER for the paper-aligned design (PAPER_ALIGNMENT_PLAN.md, Phase 4): evolving epoch committees hold
+ * bucket keys and release capsules from their handover messages. One process plays every party with throwaway
+ * accounts and serves the UI on 127.0.0.1; in a real deployment each member, sender and recipient runs its own client.
  */
 const PORT = Number(process.env.PORT ?? 8787);
 const PUBLIC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../demo/public');
+const E = 80n;
 
+type Account = Awaited<ReturnType<Env['fund']>>;
 interface DemoCapsule {
-  id: bigint;
-  message: string;
-  tamper: boolean;
-  slots: number;
-  capsule?: Capsule;
-  anchor?: string;
-  request?: AccessRequest;
-  keys?: { privateKey: CryptoKey };
-  recovered?: string;
-  failed?: string;
-  gone?: boolean;
-  busy?: boolean;
-  pausedAtOpen?: boolean;
-  epoch?: string; // Registration epoch, for narrating when members erase its nomination keys.
+  id: bigint; message: string; copyOf?: string; sender: Account; recipient: Account;
+  open: bigint; expires: bigint; bucket: bigint; payload: EncryptedPayload;
+  u: Uint8Array; proof: Uint8Array; request?: { requestId: Uint8Array; privateKey: CryptoKey }; requestedEpoch?: bigint;
+  opened?: string; gone?: boolean;
 }
 
-let sim: LocalNetSim | undefined;
-let starting = false;
-let startError: string | undefined;
-let settings = { members: 0, nominationRounds: 0n, perSlot: 0 };
+let env: Env | undefined, workers: Workers | undefined, pool: VerifyPool | undefined;
+let people: { sender: Account; recipient: Account; outsider: Account } | undefined;
+let starting = false, startError: string | undefined;
+let settings = { members: 0, committee: 0, t: 0 };
 const capsules = new Map<string, DemoCapsule>();
-const narration: { at: number; text: string; private?: boolean; tone?: 'ok' | 'warn' | 'bad' }[] = [];
-const clock = { running: true, rate: 1 };
+const offline = new Set<number>();
+let events: WorkerEvent[] = [];
 let seenEvents = 0;
-const erasedEpochs = new Set<string>();
+const said = new Set<string>();
+const narration: { at: number; text: string; private?: boolean; tone?: 'ok' | 'warn' | 'bad' }[] = [];
+const clock = { running: true, rate: 4 };
 
 const say = (text: string, o: { private?: boolean; tone?: 'ok' | 'warn' | 'bad' } = {}) => {
   narration.push({ at: Date.now(), text, ...o });
   if (narration.length > 400) narration.splice(0, narration.length - 400);
 };
+const once = (key: string, f: () => void) => { if (!said.has(key)) { said.add(key); f(); } };
 
 /** The assert message (e.g. "Not open") from an algokit/algod error, without TEAL dumps. */
 function reason(e: unknown): string {
@@ -51,128 +52,91 @@ function reason(e: unknown): string {
   return (/in transaction \S+: (.+)$/.exec(line)?.[1] ?? /logic eval error: (.+?)(\. Details|$)/.exec(line)?.[1] ?? line).slice(0, 160);
 }
 
-async function start(o: { members: number; nominationRounds: number; perSlot: number }) {
+async function start(o: { members: number; committee: number; t: number }) {
   starting = true;
   startError = undefined;
   try {
-    await sim?.stop();
-    capsules.clear();
-    narration.length = 0;
-    seenEvents = 0;
-    erasedEpochs.clear();
-    const threshold = o.perSlot >= o.members ? ANY_RANK : (2n ** 64n * BigInt(Math.round(o.perSlot * 1000))) / BigInt(o.members * 1000);
-    settings = { members: o.members, nominationRounds: BigInt(o.nominationRounds), perSlot: o.perSlot };
-    say(`Deploying a fresh randomness beacon (own VRF key + daemon), the policy app, and enrolling ${o.members} members…`);
-    sim = await LocalNetSim.create({ members: o.members, nominationRounds: BigInt(o.nominationRounds), nominatorThreshold: threshold });
-    await sim.startMembers();
-    say(`Environment ready: beacon app ${sim.beacon.appId}, policy app ${sim.app.appId}, ${o.members} member workers online.`, { tone: 'ok' });
-  } catch (e) {
-    startError = reason(e);
+    await Promise.all(workers?.map(w => w.stop()) ?? []);
+    await pool?.close();
+    [env, workers, pool] = [undefined, undefined, undefined];
+    capsules.clear(); offline.clear(); narration.length = 0; said.clear();
+    events = []; seenEvents = 0;
+    settings = o;
+    say(`Deploying the EpochCommittee app and enrolling ${o.members} members (expected committee ${o.committee}, threshold ${o.t})…`);
+    const threshold = o.committee >= o.members ? 2n ** 64n - 1n : (2n ** 64n * BigInt(o.committee)) / BigInt(o.members);
+    const e = await deploy({ members: o.members, epochRounds: E, nominationRounds: 20n, handoverRounds: 45n, threshold,
+      shareThreshold: BigInt(o.t), bucketRounds: 2n * E, bucketLead: 6n * E });
+    people = { sender: await e.fund(), recipient: await e.fund(), outsider: await e.fund() };
+    pool = new VerifyPool();
+    workers = await startWorkers(e, pool, events);
+    env = e;
+    say(`Ready: app ${e.app.appId}. Committee ${e.params.genesisCommittee} is the genesis committee: it holds nothing and creates the first buckets. ` +
+      'Bucket keys are attested about two epochs later; until then capsules cannot be locked.', { tone: 'ok' });
+  } catch (err) {
+    startError = reason(err);
     say(`Setup failed: ${startError}`, { tone: 'bad' });
   } finally {
     starting = false;
   }
 }
 
-// The sender's client: closes nominations after the deadline and anchors the capsule once the committee is fixed.
-async function drive() {
-  if (!sim || starting) return;
-  const round = await sim.lastRound();
-  for (const c of capsules.values()) {
-    if (c.busy || c.gone || c.failed) continue;
-    c.busy = true;
-    try {
-      const record = await sim.app.getCapsule({ args: { capsuleId: c.id } }).catch(() => undefined);
-      if (!record) {
-        c.gone = true;
-        continue;
-      }
-      c.epoch ??= record.epoch.toString();
-      // Pause the round clock once when the access window opens, so a presenter can act before it expires.
-      if (!c.pausedAtOpen && record.stage === STAGE.ACTIVE && round >= record.openRound && clock.running) {
-        c.pausedAtOpen = true;
-        clock.running = false;
-        say(`Capsule ${c.id} is open for access until round ${record.expiresRound}. Round clock paused; press Run clock to continue.`, { tone: 'ok' });
-      }
-      if (record.stage === STAGE.NOMINATING && round + 1n >= record.nominationDeadline) {
-        await sim.close(c.id);
-        const r = await sim.app.getCapsule({ args: { capsuleId: c.id } });
-        say(`Capsule ${c.id}: nominations closed. Committee n = ${r.filled} of ${r.slotCount} slots, threshold ${r.threshold}.`, { tone: 'ok' });
-      } else if (record.stage === STAGE.SELECTED) {
-        const { capsule, anchor } = await sim.anchor(c.id, new TextEncoder().encode(c.message), { tamper: c.tamper });
-        Object.assign(c, { capsule, anchor });
-        say(c.tamper
-          ? `Capsule ${c.id}: sender anchored a hash that does NOT match the chain data. Holders should refuse.`
-          : `Capsule ${c.id}: sender encrypted the message, split the key and posted manifest hash, commitments and ${record.filled} deposits.`,
-        { tone: c.tamper ? 'warn' : 'ok' });
-      }
-    } catch (e) {
-      c.failed = reason(e);
-      say(`Capsule ${c.id}: ${c.failed}`, { tone: 'bad' });
-    } finally {
-      c.busy = false;
-    }
-  }
-  for (const e of sim.events.slice(seenEvents)) {
+// Workers step in lockstep with the clock (an offline member is skipped and keeps its memory, like a network outage).
+async function advance(rounds = 1) {
+  for (let i = 0; i < rounds && env && workers; i++) await stepAll(env, workers, m => !offline.has(m));
+  narrate();
+}
+
+function narrate() {
+  for (const e of events.slice(seenEvents)) {
     const who = `Member #${e.member}`;
-    if (e.nominated) say(`${who} won VRF sortition and nominated one-time holder keys for capsule ${e.nominated} slot ${e.slot} (public).`);
-    if (e.custody) say(`${who} found it holds capsule ${e.custody} slot ${e.slot} and acknowledged via the relayer.`, { private: true });
-    if (e.released) say(`${who} released capsule ${e.released} slot ${e.slot} to the bound recipient key via the relayer.`, { private: true });
-    if (e.disposed) say(`${who} disposed its share for capsule ${e.disposed} slot ${e.slot} at expiry.`, { private: true });
-    const epoch = String(e.erased);
-    if (e.erased && !erasedEpochs.has(epoch) && [...capsules.values()].some(c => c.epoch === epoch)) {
-      erasedEpochs.add(epoch);
-      say(`Members are erasing their epoch-${epoch} nomination keys: every capsule of that epoch has closed nominations, so stealing a member's state later cannot reopen those seeds.`, { private: true });
+    if (e.received) {
+      once(`r${e.received}`, () => say(`Committee ${e.received} handed over to committee ${BigInt(String(e.received)) + 1n}: ${e.messages} messages checked by every member. ` +
+        `Buckets now held: ${String(e.keys).split(',').filter(Boolean).map(kv => kv.split(':')[0]).join(', ') || 'none'}.${e.lost ? ` LOST: ${e.lost}.` : ''}`,
+      { tone: e.lost ? 'bad' : 'ok' }));
     }
-    if (e.offline) say(`${who} went offline.`, { tone: 'warn' });
+    if (e.seat) say(`${who} found it holds seat ${e.number} of committee ${e.seat} (trial decryption; nobody else knows).`, { private: true });
+    if (e.posted) say(`${who} spoke once for committee ${e.posted} seat ${e.number}: re-sharings${e.releases ? `, partials for capsule ${e.releases}` : ''}. Its shares are erased.`, { private: true });
+    if (e.erased) once(`e${e.erased}`, () => say(`Members are erasing their epoch-${e.erased} nomination keys.`, { private: true }));
+    if (e.refused) once(`x${e.refused}`, () => say(`Holders refuse capsule ${e.refused}: its proof is bound to another policy (a copied u).`, { tone: 'warn' }));
+    if (e.deleted) once(`d${e.deleted}`, () => say(`${who} deleted committee ${e.deleted}'s records; their deposits return to the app.`));
+    if (e.error) say(`${who}: ${e.error} failed: ${e.message}`, { tone: 'bad' });
   }
-  seenEvents = sim.events.length;
+  seenEvents = events.length;
 }
 
 async function tickLoop() {
   for (;;) {
-    if (sim && !starting && clock.running) await sim.tick().catch(() => {});
-    await new Promise(r => setTimeout(r, 1000 / clock.rate));
+    if (env && !starting && clock.running) await advance().catch(e => say(`Clock: ${reason(e)}`, { tone: 'bad' }));
+    await sleep(1000 / clock.rate);
   }
 }
 
 async function state() {
-  if (!sim || starting) return { ready: false, starting, error: startError, narration: narration.slice(-200), clock };
-  const s = sim;
-  const round = await s.lastRound();
-  const { genesisId } = await s.algorand.client.network();
+  if (!env || !workers || starting) return { ready: false, starting, error: startError, narration: narration.slice(-200), clock };
+  const round = await lastRound(), epoch = round / E, w = windows(env.params, epoch);
+  const received = events.filter(e => e.received);
+  const history = [...new Set(received.map(e => String(e.received)))].slice(-6).reverse().map(c => {
+    const views = received.filter(e => e.received === c);
+    return { committee: c, messages: Number(views[0]!.messages), lost: String(views[0]!.lost), agree: new Set(views.map(v => v.keys)).size === 1,
+      buckets: String(views[0]!.keys).split(',').filter(Boolean).map(kv => ({ bucket: kv.split(':')[0], key: kv.split(':')[1]!.slice(0, 10) })) };
+  });
   const list = [];
   for (const c of [...capsules.values()].reverse()) {
-    const record = c.gone ? undefined : await s.app.getCapsule({ args: { capsuleId: c.id } }).catch(() => undefined);
-    const holdings = s.holdings(c.id);
-    const holderOf = new Map<string, number>();
-    for (const [member, held] of holdings) for (const k of held) holderOf.set(k, member);
-    const slots = record && record.stage >= STAGE.NOMINATING
-      ? (await s.reader.slots(c.id, slotRange(record))).map((x, k) => ({
-          k, filled: x.filled, nominator: Number(x.nominator), rank: Number(x.rank) / 2 ** 64,
-          deposited: x.deposited, acknowledged: x.acknowledged, released: x.released, holder: holderOf.get(String(k)),
-        }))
-      : [];
-    list.push({
-      id: c.id.toString(), message: c.message, tamper: c.tamper, slotCount: c.slots, failed: c.failed, gone: !record,
-      recovered: c.recovered, requested: !!c.request, slots,
-      record: record && {
-        stage: Number(record.stage), seedRound: Number(record.seedRound), deadline: Number(record.nominationDeadline),
-        openRound: Number(record.openRound), expiresRound: Number(record.expiresRound), filled: Number(record.filled),
-        threshold: Number(record.threshold), minHolders: Number(record.minHolders), acks: Number(record.acks),
-        deposits: Number(record.deposits), requested: record.requested, registrySize: Number(record.registrySize),
-        randomness: Buffer.from(record.randomness).toString('hex'), manifestHash: Buffer.from(record.manifestHash).toString('hex'),
-      },
-    });
+    const record = c.gone ? undefined : await env.reader.capsuleRecord(c.id).catch(() => undefined);
+    const releasedBy = events.filter(e => String(e.releases ?? '').split(',').includes(c.id.toString())).length;
+    list.push({ id: c.id.toString(), message: c.message, copyOf: c.copyOf, open: Number(c.open), expires: Number(c.expires), bucket: Number(c.bucket),
+      requested: !!record?.requested, opened: c.opened, gone: !record, releasedBy, refused: events.some(e => e.refused === c.id.toString()) });
   }
+  const seats = async (k: bigint) => env!.reader.seats(k).catch(() => []);
+  const office = await seats(epoch), next = await seats(epoch + 1n);
   return {
-    ready: true, clock, round: Number(round), genesisId,
-    env: {
-      appId: s.app.appId.toString(), beaconAppId: s.beacon.appId.toString(), sender: s.sender.toString(),
-      recipient: s.recipient.toString(), relayer: s.relayer.toString(), nominationRounds: Number(settings.nominationRounds),
-      perSlot: settings.perSlot,
-    },
-    members: s.members.map(m => ({ index: m.index, address: m.account.toString(), online: !!m.worker })),
+    ready: true, clock, round: Number(round),
+    env: { appId: env.app.appId.toString(), epochRounds: Number(E), t: Number(env.params.shareThreshold), genesis: Number(env.params.genesisCommittee),
+      bucketRounds: Number(env.params.bucketRounds), members: settings.members, committee: settings.committee },
+    epoch: { epoch: Number(epoch), start: Number(epoch * E), nominate: w.nominate.map(Number), handover: w.handover.map(Number), end: Number((epoch + 1n) * E - 1n),
+      inOffice: office.length, posted: office.filter(s => s.value.finalized).length, nominated: next.length },
+    history,
+    members: env.members.map((m, i) => ({ index: i, address: m.account.toString(), online: !offline.has(i), seats: workers![i]!.view(epoch)?.holders.length ?? 0 })),
     capsules: list,
     narration: narration.slice(-200),
   };
@@ -184,10 +148,29 @@ const find = (id: string) => {
   return c;
 };
 
+/** Locks a capsule under the bucket of its expiry round, using that bucket's key from the latest attested state. */
+async function lock(o: { message: string; openIn: bigint; length: bigint; from: Account; to: Account; copy?: DemoCapsule }) {
+  const e = env!, round = await lastRound();
+  const open = round + o.openIn, expires = open + o.length, bucket = expires / e.params.bucketRounds;
+  const key = await bucketKey(e.reader, bucket, settings.t, round / E - 1n);
+  if (!key) throw new Error(`Bucket ${bucket}'s key is not attested yet: let the clock run (keys appear about two epochs after a bucket is created).`);
+  const label = capsuleLabel(e.app.appId, { sender: o.from.toString(), recipient: o.to.toString(), openRound: open, expiresRound: expires });
+  const sealed = sealCapsule(key, label, new TextEncoder().encode(o.message));
+  const id = (await e.app.send.registerCapsule({ sender: o.from, args: {
+    recipient: o.to.toString(), openRound: open, expiresRound: expires, u: o.copy?.u ?? sealed.u, proof: o.copy?.proof ?? sealed.proof,
+    payloadHash: sealed.payloadHash, payment: algorand.createTransaction.payment({ sender: o.from, receiver: e.app.appAddress, amount: microAlgo(CAPSULE_DEPOSIT) }),
+  } })).return!;
+  const c: DemoCapsule = { id, message: o.message, sender: o.from, recipient: o.to, open, expires, bucket, payload: sealed.payload,
+    u: o.copy?.u ?? sealed.u, proof: o.copy?.proof ?? sealed.proof, ...(o.copy ? { copyOf: o.copy.id.toString() } : {}) };
+  capsules.set(id.toString(), c);
+  return c;
+}
+
 const actions: Record<string, (body: Record<string, unknown>, id?: string) => Promise<unknown>> = {
   async start(b) {
     if (starting) throw new Error('Already starting');
-    void start({ members: Number(b.members ?? 16), nominationRounds: Number(b.nominationRounds ?? 40), perSlot: Number(b.perSlot ?? 3) });
+    const members = Math.min(Math.max(Number(b.members ?? 10), 4), 16);
+    void start({ members, committee: Math.min(Math.max(Number(b.committee ?? members), 3), members), t: Math.max(Number(b.t ?? 3), 1) });
     return {};
   },
   async clock(b) {
@@ -196,61 +179,59 @@ const actions: Record<string, (body: Record<string, unknown>, id?: string) => Pr
     return clock;
   },
   async advance(b) {
-    for (let i = 0; i < Math.min(Number(b.rounds ?? 1), 100); i++) await sim!.tick();
+    await advance(Math.min(Number(b.rounds ?? 10), 120));
     return {};
   },
   async capsule(b) {
     const message = String(b.message ?? '').slice(0, 2000);
     if (!message) throw new Error('Message required');
-    const slots = Number(b.slots ?? 9);
-    const terms = await sim!.register({ slots, minHolders: Number(b.minHolders ?? 5), openIn: BigInt(Number(b.openIn ?? 20)),
-      length: BigInt(Number(b.length ?? 60)) });
-    capsules.set(terms.capsuleId.toString(), { id: terms.capsuleId, message, tamper: !!b.tamper, slots });
-    say(`Capsule ${terms.capsuleId} registered: ${slots} slots, beacon seed at round ${terms.seedRound}, nominations until ${terms.deadline}, open [${terms.openRound}, ${terms.expiresRound}).`, { tone: 'ok' });
-    return { id: terms.capsuleId.toString() };
+    const c = await lock({ message, openIn: BigInt(Number(b.openIn ?? 10)), length: BigInt(Number(b.length ?? 240)), from: people!.sender, to: people!.recipient });
+    say(`Capsule ${c.id} locked under bucket ${c.bucket}'s key: open [${c.open}, ${c.expires}). Only the sender knows the plaintext; the chain holds u, a proof bound to the policy, and the payload hash.`, { tone: 'ok' });
+    return { id: c.id.toString() };
+  },
+  async copy(_b, id) {
+    const original = find(id!);
+    const c = await lock({ message: '(copied u: should never open)', openIn: 5n, length: 2n * E, from: people!.outsider, to: people!.outsider, copy: original });
+    say(`An outsider registered capsule ${c.id} reusing capsule ${original.id}'s u and proof under its own policy, hoping the committee decrypts it.`, { tone: 'warn' });
+    return { id: c.id.toString() };
   },
   async request(b, id) {
     const c = find(id!);
-    if (!c.anchor) throw new Error('Not anchored yet');
-    const as = b.as === 'outsider' ? sim!.outsider : sim!.recipient;
-    const label = b.as === 'outsider' ? 'A different wallet' : c.request ? 'The recipient (again, with a fresh key)' : 'The recipient';
+    const as = b.as === 'outsider' && !c.copyOf ? people!.outsider : c.recipient;
+    const keys = await generateEphemeralKey(), requestId = randomBytes(16);
     try {
-      const { request, keys } = await sim!.request(c.id, c.anchor, { as });
-      Object.assign(c, { request, keys });
-      say(`Capsule ${c.id}: recipient bound a fresh X25519 request key on-chain. Holders will encrypt shares only to that key.`, { tone: 'ok' });
+      await env!.app.send.requestAccess({ sender: as, args: { capsuleId: c.id, requestId, recipientKey: Buffer.from(keys.publicKey, 'base64url') } });
     } catch (e) {
-      say(`Capsule ${c.id}: ${label} tried to request access → rejected: ${reason(e)}`, { tone: 'warn' });
+      say(`Capsule ${c.id}: ${as === c.recipient ? 'the recipient' : 'a different wallet'} tried to request access → rejected: ${reason(e)}`, { tone: 'warn' });
       throw e;
     }
+    Object.assign(c, { request: { requestId, privateKey: keys.privateKey }, requestedEpoch: (await lastRound()) / E });
+    say(`Capsule ${c.id}: the recipient bound a fresh X25519 key on-chain. The committee in office releases partials sealed to it at its handover.`, { tone: 'ok' });
     return {};
   },
-  async recover(_b, id) {
+  async open(_b, id) {
     const c = find(id!);
-    if (!c.request || !c.keys || !c.capsule || !c.anchor) throw new Error('Request access first');
-    try {
-      const { plaintext, releases } = await sim!.recover(c.id, c.anchor, c.capsule.payload, c.request, c.keys.privateKey);
-      c.recovered = new TextDecoder().decode(plaintext);
-      say(`Capsule ${c.id}: recipient rebuilt the manifest from chain data, verified ${releases} releases and decrypted locally.`, { tone: 'ok' });
-    } catch (e) {
-      say(`Capsule ${c.id}: recovery failed: ${reason(e)}`, { tone: 'bad' });
-      throw e;
-    }
-    return { plaintext: c.recovered };
+    if (!c.request || c.requestedEpoch === undefined) throw new Error('Request access first');
+    const round = await lastRound(), epoch = round / E;
+    const last = round > windows(env!.params, epoch).handover[1] ? epoch : epoch - 1n; // The latest completed handover.
+    const plain = await openCapsule(env!.reader, env!.pins, c.id, c.request, c.payload, settings.t, c.requestedEpoch, last);
+    if (!plain) throw new Error(`Not released yet: the committee in office releases at its handover (rounds ${windows(env!.params, epoch).handover.join('–')}).`);
+    c.opened = new TextDecoder().decode(plain);
+    say(`Capsule ${c.id}: the recipient checked t partials against the attested commitments, combined them into the key and decrypted locally.`, { tone: 'ok' });
+    return { plaintext: c.opened };
   },
   async cleanup(_b, id) {
-    await sim!.cleanup(find(id!).id);
-    say(`Capsule ${id}: boxes deleted; deposits refunded to the sender. (Chain history still shows everything posted.)`);
+    const c = find(id!);
+    await env!.app.send.deleteCapsule({ args: { capsuleId: c.id }, sender: people!.outsider, extraFee: microAlgo(1_000) });
+    c.gone = true;
+    say(`Capsule ${id}: record deleted and the deposit refunded. Its bucket is dropped at the first handover after its window ends.`);
     return {};
   },
   async member(b, id) {
-    const m = sim!.members[Number(id)];
-    if (!m) throw new Error('Unknown member');
-    if (b.online) {
-      await sim!.startMember(m);
-      say(`Member #${m.index} came back online and rescans the chain for its slots.`, { tone: 'ok' });
-    } else {
-      await sim!.stopMember(m);
-    }
+    const i = Number(id);
+    if (!env?.members[i]) throw new Error('Unknown member');
+    if (b.online) { offline.delete(i); say(`Member #${i} is back: it catches up on the handovers it missed, in order.`, { tone: 'ok' }); }
+    else { offline.add(i); say(`Member #${i} went offline (it keeps its memory; its seats stay silent).`, { tone: 'warn' }); }
     return {};
   },
 };
@@ -266,7 +247,7 @@ createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/api/state') return send(res, 200, await state());
     const m = /^\/api\/(\w+)(?:\/(\w+))?$/.exec(url.pathname);
     if (req.method === 'POST' && m && actions[m[1]!]) {
-      if (m[1] !== 'start' && (!sim || starting)) throw new Error('Environment not ready');
+      if (m[1] !== 'start' && (!env || starting)) throw new Error('Environment not ready');
       let raw = '';
       for await (const chunk of req) {
         raw += chunk;
@@ -286,8 +267,7 @@ createServer(async (req, res) => {
   }
 }).listen(PORT, '127.0.0.1', () => console.log(`Capsule lab: http://127.0.0.1:${PORT}  (LocalNet only)`));
 
-setInterval(() => void drive().catch(() => {}), 500);
 void tickLoop();
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
-  process.on(signal, () => void (sim?.stop() ?? Promise.resolve()).finally(() => process.exit(0)));
+  process.on(signal, () => void Promise.all(workers?.map(w => w.stop()) ?? []).then(() => pool?.close()).finally(() => process.exit(0)));
 }

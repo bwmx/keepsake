@@ -3,7 +3,7 @@ import { ABIType, encodeUint64 } from 'algosdk';
 import { encode } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/crypto.js';
 import { microAlgo } from '@algorandfoundation/algokit-utils';
 import {
-  APP_SPEC, CommitteeFromTuple, SeatFromTuple, type Committee, type EpochCommitteeClient, type Seat,
+  APP_SPEC, CapsuleRecordFromTuple, CommitteeFromTuple, SeatFromTuple, type CapsuleRecord, type Committee, type EpochCommitteeClient, type Seat,
 } from '../smart_contracts/artifacts/epoch_committee/EpochCommitteeClient.js';
 import { ChainReader, hex, type ChainPins } from './chain.js';
 
@@ -11,7 +11,7 @@ import { ChainReader, hex, type ChainPins } from './chain.js';
  * Off-chain side of the EpochCommittee app (PAPER_ALIGNMENT_PLAN.md Phase 1): its round windows, shared message
  * formats, seat ordering, and handover messages posted as chunks and rebuilt from block data.
  */
-export type { Committee, Seat };
+export type { CapsuleRecord, Committee, Seat };
 export interface EpochParams {
   epochRounds: bigint; nominationRounds: bigint; handoverRounds: bigint;
   shareThreshold: bigint; bucketRounds: bigint; bucketLead: bigint; genesisCommittee: bigint;
@@ -20,7 +20,7 @@ export interface EpochParams {
 const u64 = (n: bigint) => Buffer.from(encodeUint64(n));
 const sha = (...parts: Uint8Array[]) => { const h = createHash('sha256'); for (const p of parts) h.update(p); return h.digest(); };
 const struct = (name: string) => ABIType.from(`(${APP_SPEC.structs[name]!.map(f => f.type).join(',')})`);
-const SEAT = struct('Seat'), COMMITTEE = struct('Committee');
+const SEAT = struct('Seat'), COMMITTEE = struct('Committee'), CAPSULE = struct('CapsuleRecord');
 
 /** Inclusive round windows of epoch e: nominations for committee e + 1, then committee e's handover. */
 export const windows = (p: EpochParams, epoch: bigint) => {
@@ -58,9 +58,12 @@ export const seatSeedContext = (pins: ChainPins, committee: bigint, nominator: b
   'ecpss/seat-seed/v1', pins.genesisHash, pins.appId.toString(), committee.toString(), nominator.toString(),
 ]);
 
-/** What a seat's one-time key signs to claim it for `holder` (a 32-byte account public key); must match `claim`. */
-export const claimMessage = (appId: bigint, committee: bigint, nominator: bigint, holder: Uint8Array) =>
-  Buffer.concat([Buffer.from('ecpss/claim/v1'), u64(appId), u64(committee), u64(nominator), holder]);
+/**
+ * What a seat's one-time key signs to claim it for `holder` (a 32-byte account public key), attesting the committee's
+ * public state it received (ecpss `stateDigest`); must match `claim`.
+ */
+export const claimMessage = (appId: bigint, committee: bigint, nominator: bigint, holder: Uint8Array, stateDigest: Uint8Array) =>
+  Buffer.concat([Buffer.from('ecpss/claim/v1'), u64(appId), u64(committee), u64(nominator), holder, stateDigest]);
 
 // A chunk is four argument parts and the note. Arguments total 16,384 bytes: selector 4 + two uint64 16 + four
 // 2-byte length prefixes 8 leave 16,356 bytes of data; the note holds 4,096.
@@ -118,6 +121,19 @@ export class EpochReader extends ChainReader {
     return all.filter(s => unique(s.value.sigKey) && unique(s.value.epk))
       .sort((a, b) => Buffer.compare(Buffer.from(a.value.sigKey), Buffer.from(b.value.sigKey)))
       .map((s, i) => ({ seat: i + 1, ...s }));
+  }
+
+  async capsuleRecord(id: bigint): Promise<CapsuleRecord> {
+    await this.lastRound();
+    return CapsuleRecordFromTuple(CAPSULE.decode((await this.box(Buffer.from('x'), u64(id))).value) as never);
+  }
+
+  /** Every registered capsule still on chain (deleted after expiry). */
+  async capsuleRecords(): Promise<{ id: bigint; record: CapsuleRecord }[]> {
+    await this.lastRound();
+    const { boxes } = await this.algod.getApplicationBoxes(this.pins.appId).do();
+    const ids = boxes.map(b => Buffer.from(b.name)).filter(n => n.length === 9 && n[0] === 0x78 /* x */).map(n => n.readBigUInt64BE(1));
+    return Promise.all(ids.map(async id => ({ id, record: await this.capsuleRecord(id) })));
   }
 
   /** Every nominator with a seat box in committee c, including seats dropped from the ordering (for deletion). */

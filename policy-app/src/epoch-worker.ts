@@ -4,11 +4,14 @@ import { AlgorandClient, Config, microAlgo } from '@algorandfoundation/algokit-u
 import { nullLogger } from '@algorandfoundation/algokit-utils/types/logging';
 import vrf from '@bwmx/algorand-vrf-utils-ts';
 import { check, generateEphemeralKey, open, seal, type EphemeralKeyPair } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/crypto.js';
-import { encodeMessage, handover, seatKeys, type Holder, type Public } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/ecpss.js';
+import {
+  capsulePartial, encodeMessage, encodeState, handover, seatKeys, stateDigest, type Holder, type Public,
+} from 'algorand-ephemeral-capsule-crypto-spike/dist/src/ecpss.js';
 import { VerifyPool, receiveParallel } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/parallel.js';
-import { decodeG2 } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/pvss.js';
+import { decodeG1, decodeG2, encodePartial, seatCommitment } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/pvss.js';
 import { EpochCommitteeClient } from '../smart_contracts/artifacts/epoch_committee/EpochCommitteeClient.js';
 import { b64url, vrfRank, type ChainPins } from './chain.js';
+import { capsuleLabel, proofFromBytes, releaseContext } from './epoch-capsules.js';
 import {
   EpochReader, claimMessage, handoverBuckets, nominationAlpha, postMessage, seatSeedContext, windows, type EpochParams, type OrderedSeat,
 } from './epochs.js';
@@ -30,8 +33,9 @@ interface MySeat { seat: number; nominator: bigint; x: bigint; sign: (message: U
  * - posts its nomination keys for the current and next epoch;
  * - nominates if eligible (§3.1.2), sealing a fresh seat to a uniformly chosen member;
  * - opens its seats once nominations close, then erases that epoch's key;
- * - as a holder, builds its single handover message (§3.1.3), erases its shares, claims the seat and posts the
- *   message from its own account. No relayer: posting reveals the holder only after it has erased.
+ * - as a holder, builds its single handover message (§3.1.3): re-sharings, new-bucket contributions, a sealed
+ *   decryption partial for each authorized capsule, and the public state it attests. It then erases its shares, claims
+ *   the seat and posts from its own account. No relayer: posting reveals the holder only after it has erased.
  * - processes every handover whose window has closed, in order (catching up after an outage while the blocks and
  *   seat records last), verifying on the thread pool and combining shares for its seats in the next committee.
  * All secrets live only in memory. A restarted member has neither its seats nor the public history: it would have to
@@ -72,8 +76,10 @@ export async function startEpochWorker(cfg: EpochWorkerConfig) {
   let opened = params.genesisCommittee - 2n; // Last epoch whose nominations were opened (committee = epoch + 1).
   let processed = params.genesisCommittee - 1n; // Last committee whose handover was processed.
 
-  async function postKeys(epoch: bigint) {
-    for (const e of [epoch, epoch + 1n]) {
+  // The next epoch's key waits until nominations close, so key posts never crowd the nomination window; a holder still
+  // has it before it speaks.
+  async function postKeys(epoch: bigint, next: boolean) {
+    for (const e of next ? [epoch, epoch + 1n] : [epoch]) {
       if (keys.has(e) || e < params.genesisCommittee - 1n) continue; // Earlier keys would never be opened or erased.
       if (await reader.nominationKey(e, myIndex)) { keys.set(e, undefined); continue; }
       const pair = await generateEphemeralKey();
@@ -145,14 +151,31 @@ export async function startEpochWorker(cfg: EpochWorkerConfig) {
     if (!view || !mine?.length || !next || !keys.has(epoch + 1n)) return;
     seats.delete(epoch);
     const epks = next.map(s => decodeG2(s.value.epk)), buckets = handoverBuckets(params, epoch);
+    const state = encodeState(view.pub), digest = stateDigest(state);
+    // Capsules this committee releases: requested, still open, under a bucket it holds.
+    const round = await reader.lastRound();
+    const capsules = (await reader.capsuleRecords()).filter(({ record }) => record.requested && round + 1n < record.expiresRound && view.pub.has(record.bucket));
     for (const m of mine) {
       const holder = view.holders.find(h => h.seat === m.seat)!;
-      const message = encodeMessage(handover(holder, view.pub, epoch, { live: buckets.live.filter(b => view.pub.has(b)), create: buckets.create }, epks, t));
+      const releases = new Map<bigint, Uint8Array>();
+      for (const { id, record } of capsules) {
+        try {
+          const p = capsulePartial(holder.shares.get(record.bucket)!, seatCommitment(view.pub.get(record.bucket)!, m.seat), decodeG1(record.u),
+            proofFromBytes(record.proof), capsuleLabel(cfg.pins.appId, record)); // Refuses a u whose proof belongs to another policy.
+          const sealed = await seal(b64url(record.recipientKey), encodePartial(p), releaseContext(cfg.pins, id, record.requestId, epoch, m.seat));
+          releases.set(id, Buffer.concat([Buffer.from(sealed.enc, 'base64url'), Buffer.from(sealed.ciphertext, 'base64url')]));
+        } catch (e) {
+          event({ refused: id.toString(), reason: e instanceof Error ? e.message : String(e) });
+        }
+      }
+      const message = encodeMessage({
+        ...handover(holder, view.pub, epoch, { live: buckets.live.filter(b => view.pub.has(b)), create: buckets.create }, epks, t), releases, state,
+      });
       holder.shares.clear(); // Erase before speaking; only the seat's signing key remains, to claim it.
-      await app.send.claim({ ...cover, args: {
-        committee: epoch, nominator: m.nominator, holder: member.addr.toString(), signature: m.sign(claimMessage(cfg.pins.appId, epoch, m.nominator, member.addr.publicKey)) } });
+      await app.send.claim({ ...cover, args: { committee: epoch, nominator: m.nominator, holder: member.addr.toString(), stateDigest: digest,
+        signature: m.sign(claimMessage(cfg.pins.appId, epoch, m.nominator, member.addr.publicKey, digest)) } });
       await postMessage(app, member.addr.toString(), epoch, m.nominator, message);
-      event({ posted: epoch.toString(), number: m.seat.toString() });
+      event({ posted: epoch.toString(), number: m.seat.toString(), releases: [...releases.keys()].join(',') });
     }
   }
 
@@ -190,7 +213,7 @@ export async function startEpochWorker(cfg: EpochWorkerConfig) {
 
   async function step() {
     const round = await reader.lastRound(), epoch = round / E, w = windows(params, epoch);
-    await postKeys(epoch).catch(report('keys')); // Raced with an epoch boundary: retried next step.
+    await postKeys(epoch, round >= w.nominate[1]).catch(report('keys')); // Raced with an epoch boundary: retried next step.
     if (round + 1n >= w.nominate[0] && round + 1n <= w.nominate[1]) await nominate(epoch).catch(report('nominate'));
     // Catch up in order: seats are opened before the handover into them is processed.
     while (opened + 1n < epoch || (opened + 1n === epoch && round >= w.nominate[1])) await openSeats(++opened);

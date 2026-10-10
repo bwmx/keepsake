@@ -5,7 +5,7 @@ import { algo } from '@algorandfoundation/algokit-utils';
 import vrf from '@bwmx/algorand-vrf-utils-ts';
 import { generateEphemeralKey, open, seal } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/crypto.js';
 import {
-  dealerGenesis, decodeMessage, encodeMessage, handover, receive, reconstruct, seatKeys, type Message,
+  dealerGenesis, decodeMessage, encodeMessage, encodeState, handover, receive, reconstruct, seatKeys, stateDigest, type Message,
 } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/ecpss.js';
 import { decodeG2 } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/pvss.js';
 import { EpochCommitteeFactory } from '../smart_contracts/artifacts/epoch_committee/EpochCommitteeClient.js';
@@ -104,9 +104,10 @@ test('handover on chain: holders claim seats and post one message each; readers 
   await env.nextRoundIs(c1 * E + 1n);
   for (const m of env.members) await nominate(env, m, c2, await captured(env, c2));
   const [first, cheater] = [seats1[0]!, seats1[seats1.length - 1]!];
+  const digest = stateDigest(encodeState(state.pub)); // Holders attest the public state they received.
   const claim = (s: (typeof seats1)[number], signer = s.keys) => env.app.send.claim({ ...cover, sender: s.holder.account, args: {
-    committee: c1, nominator: s.nominator, holder: s.holder.account.toString(),
-    signature: signer.sign(claimMessage(env.app.appId, c1, s.nominator, s.holder.account.publicKey)) } });
+    committee: c1, nominator: s.nominator, holder: s.holder.account.toString(), stateDigest: digest,
+    signature: signer.sign(claimMessage(env.app.appId, c1, s.nominator, s.holder.account.publicKey, digest)) } });
   await rejects(claim(first), 'Not handing over'); // Still the nomination window.
   await env.nextRoundIs(windows(env.params, c1).nominate[1] + 1n);
   const seats2 = await openSeats(env, c2, await env.reader.seats(c2));
@@ -120,7 +121,7 @@ test('handover on chain: holders claim seats and post one message each; readers 
     await claim(s);
     const holder = state.holders.find(h => h.seat === s.seat)!;
     // One holder misbehaves: 50 KB of garbage in three chunks instead of a handover message.
-    const message = s === cheater ? randomBytes(50_000) : encodeMessage(handover(holder, state.pub, c1, buckets, keys2, t));
+    const message = s === cheater ? randomBytes(50_000) : encodeMessage({ ...handover(holder, state.pub, c1, buckets, keys2, t), state: encodeState(state.pub) });
     await postMessage(env.app, s.holder.account.toString(), c1, s.nominator, message);
     posted.set(s.seat, message);
   }

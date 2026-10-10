@@ -177,6 +177,19 @@ export function verifyPartial(commitment: G1Point, u: G1Point, p: Partial): bool
 const partialChallenge = (commitment: G1Point, u: G1Point, d: GT, a1: GT, a2: GT) =>
   hashScalar('pvss/partial/v1', commitment.toBytes(), u.toBytes(), Fp12.toBytes(d), Fp12.toBytes(a1), Fp12.toBytes(a2));
 
+/** A partial on the wire: d in GT (576 bytes), c (32), z in G2 (96). */
+export const PARTIAL_SIZE = 576 + 32 + 96;
+export const encodePartial = (p: Partial) => Buffer.concat([Fp12.toBytes(p.d), scalarBytes(p.proof.c), p.proof.z.toBytes()]);
+/** Strict decoding: d must lie in GT (order r), c be canonical and z a valid G2 point. */
+export function decodePartial(bytes: Uint8Array): Partial {
+  if (bytes.length !== PARTIAL_SIZE) throw new Error('Bad partial length');
+  const d = Fp12.fromBytes(bytes.subarray(0, 576));
+  if (!Fp12.eql(Fp12.pow(d, ORDER), Fp12.ONE)) throw new Error('Partial not in GT');
+  const c = BigInt(`0x${Buffer.from(bytes.subarray(576, 608)).toString('hex')}`);
+  if (c >= ORDER) throw new Error('Non-canonical scalar');
+  return { d, proof: { c, z: decodeG2(bytes.subarray(608)) } };
+}
+
 /** The KEM key from t verified partials of distinct seats. */
 export function combinePartials(parts: { seat: number; d: GT }[]): GT {
   const weights = lagrange(parts.map(p => p.seat));

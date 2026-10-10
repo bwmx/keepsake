@@ -1,6 +1,6 @@
 # Paper alignment plan
 
-Drafted 2026-10-09; Phases 0–3 done the same day. This is a design proposal; no cryptographer has reviewed it yet, and none of it is implemented except where marked done. It aims to move the demo from one hidden committee per capsule to the paper's evolving-committee proactive secret sharing (ECPSS, [eprint 2020/464](https://eprint.iacr.org/2020/464) §3) on Algorand. The stack stays the same: Puya TS contract, TypeScript off-chain. Section numbers (§) refer to the paper.
+Drafted 2026-10-09; Phases 0–4 done the same day. This is a design proposal; no cryptographer has reviewed it yet, and none of it is implemented except where marked done. It aims to move the demo from one hidden committee per capsule to the paper's evolving-committee proactive secret sharing (ECPSS, [eprint 2020/464](https://eprint.iacr.org/2020/464) §3) on Algorand. The stack stays the same: Puya TS contract, TypeScript off-chain. Section numbers (§) refer to the paper.
 
 ## Where we are
 
@@ -205,6 +205,42 @@ Proofs of knowledge for new keys are bound to the committee, bucket and dealer.
 - An outage here means a member keeps its memory. A restarted member would have to replay every handover since genesis from an archival node, which is not implemented.
 - Tests step the workers once per round; real workers poll.
 
+## Phase 4 results (done 2026-10-09)
+
+**It meets the "done when" list on LocalNet.** `test/epoch-capsules.test.ts` runs eight member workers. It has passed twice in a row and takes about 80 seconds. It shows that:
+- a capsule locked under an attested bucket key is released privately at the next handover and decrypts;
+- requests are refused before opening, from the wrong wallet, for a second key and after expiry;
+- a capsule that copies another's u under its own policy is refused by every holder;
+- the sender's deposit is refunded after expiry;
+- after its last handover the expired capsule's bucket is held by nobody and re-dealt by nobody.
+
+Capsule Lab now runs this design (see `policy-app/README.md`). A smoke test through its API (lock, wrong wallet, request, open, replay) ran cleanly.
+
+**What was added:**
+- **Contract.** `EpochCommittee` gains:
+  - `registerCapsule`, under bucket `expiresRound / bucketRounds`, with an exact deposit; the bucket must exist by schedule and the window must span at least two epochs;
+  - `requestAccess`, once per capsule;
+  - `deleteCapsule`, which refunds the deposit;
+  - a state digest signed into each claim.
+- **Message sections.** A holder's handover message gains two sections:
+  - **releases:** per capsule, a partial sealed to the recipient's key, with a proof against its seat commitment;
+  - **state:** the holder's view of the committee's public commitments.
+- **Library.** `crypto-spike/src/ecpss.ts` adds the state encoding, its digest, and an entry walker that reads these sections without decoding any dealing. `pvss.ts` adds the partial wire format, checked strictly, including membership of the order-r subgroup.
+- **Client.** `policy-app/src/epoch-capsules.ts` holds the capsule label (sender, recipient and window), the attested state, and the sender and recipient sides.
+
+**Departures from the plan:**
+- **Attested state.** Senders and recipients need public commitments without replaying the whole history. Holders therefore sign a digest of the state they received when they claim, and the state itself travels in their messages. A state attested by at least t seats includes an honest seat's view, since fewer than t are corrupt. The same mechanism could let a restarted member rejoin; not built.
+- **The label leaves out the payload hash.** The payload key is derived from the label, so including the hash would be circular. The hash is anchored on-chain separately, and AEAD authenticates the payload.
+- **Bucket lead.** A bucket's key is attested about an epoch after the bucket is created, so `bucketLead` must cover the capsule horizon plus about two epochs. With a two-epoch lead, a test capsule could never be locked.
+- **Replay protection lives off-chain.** The contract does not check the sender's proof; holders do, before releasing anything. A copied u can be registered, but it is never released.
+
+**Found while building:**
+- **Key posts crowded the nomination window.** On dev-mode LocalNet every transaction takes a round, and posting next-epoch keys at the start of each epoch starved nominations. Committees shrank below t in the demo. Workers now post the next key after nominations close, still before they speak.
+
+**Not done:**
+- **Partial latency.** Releases wait for the next handover, up to an epoch. A faster path would be a documented deviation.
+- **Legacy design still present.** `CapsulePolicy`, `src/sim.ts` and `src/worker.ts` still exist and are tested; Capsule Lab no longer uses them. Removing them is the user's call.
+
 ## Crypto sketch for D2 (review before implementing)
 
 This works in BLS12-381 with generators g1 ∈ G1 and g2 ∈ G2 and pairing e. The secret is the group element S = s·g2. The public key is P = s·g1.
@@ -274,7 +310,7 @@ Precedents: pairing-based PVSS in SCRAPE (Cascudo and David, 2017), and group-el
   - the indexer shows exactly one handover message per holder per epoch, sent after its key rotation;
   - no relayer is involved.
 
-**Phase 4: capsules on bucket keys. Size: medium.**
+**Phase 4: capsules on bucket keys. Done 2026-10-09; see Phase 4 results.**
 - Registration carries the policy, U, the proof, the payload hash and the bucket. Request binding stays as today. Releases come from handover messages. Update Capsule Lab.
 - Done when:
   - private release works;
@@ -298,7 +334,7 @@ Precedents: pairing-based PVSS in SCRAPE (Cascudo and David, 2017), and group-el
 | Fixed slots, one winner each | Phase 1 (done) |
 | Committee size and threshold | Phase 0 parameters; Phases 1 and 3 |
 | No verifiable re-sharing (§2.5, §2.6) | Phase 2 (done), with RIND-SO still open |
-| One committee per capsule; honest dealer per capsule | Phases 1, 2 and 4 (bucket DKG) |
+| One committee per capsule; honest dealer per capsule | Phases 1, 2 and 4 (bucket DKG; done) |
 | Stake weighting | Phase 5 |
 | Single-operator beacon | Phase 1 (block seed; done) |
 | Best-effort erasure | Phase 6 (better, not provable) |

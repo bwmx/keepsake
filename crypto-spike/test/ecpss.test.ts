@@ -2,10 +2,12 @@ import assert from 'node:assert/strict';
 import { createPublicKey, randomBytes, randomInt, verify } from 'node:crypto';
 import { test } from 'node:test';
 import {
-  capsulePartial, dealerGenesis, decodeMessage, encodeMessage, handover, openCapsuleKey, receive, reconstruct,
-  sealCapsuleKey, seatKeys, type Holder, type Message, type Public,
+  capsulePartial, dealerGenesis, decodeMessage, decodeState, encodeMessage, encodeState, handover, openCapsuleKey, receive, reconstruct,
+  sealCapsuleKey, seatKeys, stateDigest, type Holder, type Message, type Public,
 } from '../src/ecpss.js';
-import { dealingSize, lagrange, point, proveG1, randomScalar, seatCommitment, type G2Point } from '../src/pvss.js';
+import {
+  decodePartial, dealingSize, encodePartial, lagrange, partial, point, proveG1, randomScalar, seatCommitment, type G2Point,
+} from '../src/pvss.js';
 
 const t = 3;
 /** Mock committee selection (the chain does the real one): n seats with one-time keys from fresh seeds. */
@@ -119,6 +121,27 @@ test('handover messages survive the wire; decoding is strict', () => {
   const dup = Buffer.from(bytes); dup.writeUInt16BE(2, 0);
   const entry = bytes.subarray(2, 2 + 9 + dealingSize(4, t, false)); // The re-share entry.
   assert.throws(() => decodeMessage(Buffer.concat([dup.subarray(0, 2), entry, entry]), 1, 4, t), /Duplicate entry/);
+});
+
+test('messages carry sealed releases and the attested state; partials and states decode strictly', () => {
+  const seats = committee(4), keys = seats.map(s => s.epk);
+  const { messages } = dealerGenesis(7n, keys, t);
+  const { pub, holders } = receive(messages, new Map(), 0n, { live: [], create: [7n] }, keys, t, seats);
+  const state = encodeState(pub), sealed = randomBytes(752);
+  const m = { ...handover(holders[0]!, pub, 1n, { live: [7n], create: [] }, keys, t), releases: new Map([[42n, sealed]]), state };
+  const back = decodeMessage(encodeMessage(m), 1, 4, t);
+  assert.deepEqual(back.releases.get(42n), sealed);
+  assert.deepEqual(stateDigest(back.state), stateDigest(state));
+  assert.ok(decodeState(back.state, t).get(7n)!.every((p, l) => p.equals(pub.get(7n)![l]!)));
+  assert.throws(() => decodeState(new Map([[7n, Buffer.alloc(t * 48 - 1)]]), t), /length/);
+  assert.notDeepEqual(stateDigest(new Map([[8n, state.get(7n)!]])), stateDigest(state)); // The bucket number is attested too.
+
+  const u = point.g1(randomScalar()), p = partial(holders[0]!.shares.get(7n)!, seatCommitment(pub.get(7n)!, 1), u);
+  const bytes = encodePartial(p);
+  assert.ok(decodePartial(bytes).proof.z.equals(p.proof.z));
+  const notGT = Buffer.from(bytes); notGT[3]! ^= 1; // Almost surely outside the order-r subgroup of Fp12*.
+  assert.throws(() => decodePartial(notGT), /GT/);
+  assert.throws(() => decodePartial(bytes.subarray(1)), /length/);
 });
 
 test('seat keys are deterministic per seed, distinct across seeds, and sign', () => {
