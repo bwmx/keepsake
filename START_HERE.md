@@ -33,7 +33,7 @@ Not built:
 
 ## Verified state
 
-Current, 2026-10-10, after removing the per-capsule design: `crypto-spike` 39 passing tests; `policy-app` 7 passing LocalNet tests (the epoch design: `epochs`, `epoch-workers`, `epoch-capsules`, `epoch-join`, `epoch-stake`). Same toolchain as below, without pnpm for the beacon. Capsule Lab was driven end to end in headless Chrome 2026-10-10 through Playwright, outside the repo:
+Current, 2026-10-10, after removing the per-capsule design: `crypto-spike` 39 passing tests; `policy-app` 7 passing LocalNet tests (the epoch design: `epochs`, `epoch-workers`, `epoch-capsules`, `epoch-join`, `epoch-stake`). Same toolchain as below, without pnpm for the beacon. Capsule Lab was driven end to end in headless Chrome 2026-10-10 (`npm run browser-check` in `policy-app/`):
 - the flow: start, lock once a key is attested, wrong wallet refused, request, a copied capsule refused by holders, decrypt;
 - the operator view, and a member taken offline and back;
 - desktop, phone width (no sideways scroll) and dark mode.

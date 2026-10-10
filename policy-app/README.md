@@ -15,6 +15,7 @@ This package is the Algorand side of [the paper alignment plan](../PAPER_ALIGNME
 | `src/chain.ts` | Chain reader that fails closed, and shared helpers |
 | `demo/` | **Capsule Lab**: a local web UI for the design |
 | `smart_contracts/broadcast_probe/`, `bench/broadcast-probe.ts` | Phase 0 probe: argument and note limits and fees, an epoch of handover data posted and rebuilt from blocks, block-seed lookback, stake opcodes (`npm run probe`) |
+| `bench/browser-check.ts` | Capsule Lab in headless Chrome (`npm run browser-check`, LocalNet). It starts its own server and drives the page through the whole capsule flow, the operator view, a member outage, phone width and dark mode, and fails on any page error. Screenshots go to the git-ignored `browser-shots/`; `CHROME_PATH` overrides the browser |
 | `bench/testnet-trial.ts` | Phase 6 TestNet trial (`npm run trial`, TestNet only). It funds five throwaway members from `TESTNET_MNEMONIC` in `../.env` (git-ignored) and runs them through a public node. It runs handovers and a capsule round trip, reports timings and fees, then returns what it can to the funder. Keys of an interrupted run are kept in the git-ignored `.testnet-trial.json`; `npm run trial -- cleanup` recovers them |
 
 It runs on LocalNet, and a five-member trial has run on TestNet. All cryptography stays in the [crypto spike](../crypto-spike/README.md). The earlier per-capsule design (`CapsulePolicy`, beacon-seeded slots and a relayer) was removed on 2026-10-10; it is in the Git history before that date.
@@ -29,6 +30,7 @@ cd policy-app && npm exec --yes --package=pnpm@12.6.0 -- npm ci
 algokit localnet start
 npm test        # 7 LocalNet tests, about 6 minutes
 npm run demo    # Capsule Lab at http://127.0.0.1:8787
+npm run browser-check   # Capsule Lab in headless Chrome (needs Chrome installed)
 ```
 
 LocalNet must be in its default dev mode, where a block is sealed per transaction. All accounts, VRF keys and nomination keys are generated LocalNet throwaways and are never printed.
@@ -49,7 +51,7 @@ LocalNet must be in its default dev mode, where a block is sealed per transactio
 7. **Operator view.** This toggle shows which seats each member holds and its private worker log, both taken from the workers rather than the chain.
 8. **Committee security.** For the committee in office, it shows the per-epoch chance that a corrupt fraction f exposes the key or stalls a handover, using the exact-tail model from Phase 0.
 
-Checked in headless Chrome on 2026-10-10: the full capsule flow, the operator view, member outages, phone width and dark mode, with no page errors. The clock and the advance button share one queue, so a worker never runs two steps at once. The server binds to 127.0.0.1 only. The recipient's decryption happens inside the server process, standing in for the recipient's own client, and there is no wallet integration.
+`npm run browser-check` drives it in headless Chrome: the full capsule flow, the operator view, a member outage, phone width and dark mode, with no page errors (2026-10-10). The clock and the advance button share one queue, so a worker never runs two steps at once. The server binds to 127.0.0.1 only. The recipient's decryption happens inside the server process, standing in for the recipient's own client, and there is no wallet integration.
 
 ## Protocol
 
