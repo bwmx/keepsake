@@ -19,7 +19,7 @@ test('workers run 22 handovers on LocalNet: every bucket survives changing commi
   const events: Event[] = [];
   let round = 0n;
   const workers = await Promise.all(env.members.map(m => startEpochWorker({
-    pins: env.pins, algod: ALGOD, memberMnemonic: secretKeyToMnemonic(m.account.account.sk), vrfSecretKey: m.vrfSecretKey, pool, pollMs: 0,
+    pins: env.pins, algod: ALGOD, memberMnemonic: secretKeyToMnemonic(m.account.account.sk), vrfSecretKey: m.vrfSecretKey, pool, pollMs: 0, audit: true,
     event: e => events.push({ member: Number(m.index), round, ...e }),
   })));
   // Outages within the liveness margin: everyone is nominated each epoch (10 seats, t = 3), at most two members off.
@@ -31,7 +31,7 @@ test('workers run 22 handovers on LocalNet: every bucket survives changing commi
   const capture = (c: bigint) => {
     const views = workers.map(w => w.view(c)).filter(v => v !== undefined);
     if (!views.length || secrets.has(c)) return;
-    const shares = views.flatMap(v => v.holders);
+    const shares = views.flatMap(v => v.holders ?? []); // Audit mode: the vaults report their shares.
     secrets.set(c, new Map([...views[0]!.pub].map(([b, poly]) =>
       [b, reconstruct(poly, shares.filter(h => h.shares.has(b)).map(h => ({ seat: h.seat, share: h.shares.get(b)! })), t)])));
   };

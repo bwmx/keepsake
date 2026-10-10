@@ -200,6 +200,13 @@ export function combinePartials(parts: { seat: number; d: GT }[]): GT {
 
 const SCALAR = 32;
 const scalarBytes = (x: bigint) => Buffer.from(x.toString(16).padStart(SCALAR * 2, '0'), 'hex');
+/** A Schnorr proof (c, z) on the wire: two 32-byte scalars. */
+export const encodeProof = (p: Proof) => Buffer.concat([scalarBytes(p.c), scalarBytes(p.z)]);
+export function decodeProof(bytes: Uint8Array): Proof {
+  if (bytes.length !== 2 * SCALAR) throw new Error('Bad proof length');
+  const big = (b: Uint8Array) => BigInt(`0x${Buffer.from(b).toString('hex')}`);
+  return { c: big(bytes.subarray(0, SCALAR)), z: big(bytes.subarray(SCALAR)) };
+}
 export const dealingSize = (n: number, t: number, contribution: boolean) => t * 48 + n * 240 + (contribution ? 2 * SCALAR : 0);
 
 export function encodeDealing(d: Dealing): Buffer {

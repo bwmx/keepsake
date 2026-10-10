@@ -41,7 +41,7 @@ LocalNet must be in its default dev mode, where a block is sealed per transactio
 `npm run demo` serves a single page at `127.0.0.1:8787` for the paper-aligned design: `EpochCommittee` with its member workers, with capsules on bucket keys. One local server plays every party, and the workers step in lockstep with the round clock. In a real deployment each member, sender and recipient would run its own client and node. What you can do:
 
 1. **Start an environment.** Choose the number of members, the expected committee size (up to 12) and the threshold t. Each member's account goes online for consensus with throwaway participation keys. After Algorand's 320-round stake lookback, the app is deployed and members enroll with bonds of 1, 2, 3 and 5 Algo in turn. Their workers then start. The genesis committee creates the first buckets, and their keys are attested about two epochs later.
-2. **Watch the epochs.** The epoch panel shows the nomination window and the handover window, the committee in office, the messages posted, and recent handovers: messages checked, buckets held with their public keys, and whether all members agree.
+2. **Watch the epochs.** The epoch panel shows the nomination window and the handover window, the committee in office, the messages posted, and recent handovers: messages checked, the liveness margin, buckets held with their public keys, and whether all members agree. Locking refuses while the margin is 0, when one more silent seat would lose every bucket. Each member's secrets live in its own vault processes.
 3. **Lock a capsule.** The sender encrypts under the key of the bucket its expiry falls in, taken from the state the committee attested. It registers u, a proof bound to the policy, and the payload hash. There is no dealer and no per-capsule committee.
 4. **Play the recipient.**
    - Request access with a fresh key.
@@ -127,11 +127,36 @@ The member worker ([`src/epoch-worker.ts`](src/epoch-worker.ts)) handles each ep
 - **Keys.** It posts its nomination keys.
 - **Nomination.** It reads its weight as the contract does, draws a VRF for each of its tickets, and nominates one seat per winning ticket. Each seat is sealed to a member drawn by bond.
 - **Seats.** It opens its seats when nominations close, then erases that epoch's key.
-- **Handover.** As a holder, it builds its single handover message, erases its shares, claims the seat and posts the message from its own account. There is no relayer.
+- **Handover.** As a holder, it builds its single handover message and its secrets are erased. Then it claims the seat and posts the message from its own account. There is no relayer.
 - **Processing.** It processes every closed handover in order and catches up after an outage. Messages are verified on a shared thread pool (`VerifyPool` from the crypto spike), and it combines shares for its seats in the next committee.
 - **Cleanup.** It deletes the seats it nominated three committees back and recovers their deposits.
+- **Liveness.** Each `received` event reports the handover's margin: by how many valid dealings the worst kept bucket exceeds t.
 
-Secrets live only in memory. A restarted member would need to replay every handover since genesis from an archival node, which is not implemented.
+**Secrets (Phase 6).** Secrets live in one short-lived vault process per committee (`SeatVault` from the crypto spike).
+- **Contents.** A vault starts when the member posts the nomination key that opens the committee's seats, and holds:
+  - that key, as wipeable bytes;
+  - the seats' one-time keys;
+  - their shares, combined from the dealings everyone chose.
+- **Lifetime.** It builds the seats' messages, releases and claim signatures, then exits before any of them is posted. A vault whose member holds no seat exits as soon as the seats are opened.
+- **Host checks.** Vaults run with core dumps off, checked from inside, and refuse to start where swap is unencrypted (macOS) or on at all (Linux; `ECPSS_ALLOW_SWAP=1` overrides).
+- **What the worker keeps.** Only public data, its own seat numbers, and what it posts.
+- **Limits.** JavaScript can neither wipe bigints nor pin memory, so erasure is not provable: the process exit ends the secrets. A restarted member would need to replay every handover since genesis from an archival node, which is not implemented.
+
+**Running a member.** `node dist/src/epoch-worker.js` runs one member against its own algod node. It is configured by:
+- `ALGOD_SERVER`, `ALGOD_PORT`, `ALGOD_TOKEN`;
+- `GENESIS_HASH`, `APP_ID`, `MAX_ROUND_AGE_MS`;
+- `MEMBER_MNEMONIC` (an enrolled, bonded account);
+- `VRF_SECRET_KEY` (base64, 64 bytes: seed ‖ public key);
+- `POLL_MS`.
+
+It checks the host by starting a vault before anything else, and writes JSON event lines that name the member's own seats, so keep them private.
+
+**Liveness (Phase 6).** `livenessMargin` in [`src/epoch-capsules.ts`](src/epoch-capsules.ts) measures by how many seats each of these exceeds t:
+- the latest handover's agreeing attestations;
+- the committee in office;
+- the next committee, once nominated.
+
+`assertLive` refuses to lock a capsule while that margin is below a sender's minimum. One handover with fewer than t honest seats speaking loses every live bucket.
 
 **Capsules (Phase 4).** A holder's handover message also carries:
 - a decryption partial, sealed to the recipient's request key, for each capsule that is requested, still open, and under a bucket it holds;
@@ -167,12 +192,13 @@ The cryptography lives in [`crypto-spike/src/ecpss.ts`](../crypto-spike/src/ecps
 - **Indexer:** each seat's claim and finalize happen once, from its own holder (a member, never a relayer), after that member posted its key for the next epoch. Nobody speaks while offline.
 - **Cleanup:** nominators delete their old seats, and the app holds only bonds beyond its boxes' deposits. Workers report no errors.
 
-`test/epoch-capsules.test.ts` (1 test, Phase 4, about 80 seconds): with eight member workers running, it shows:
+`test/epoch-capsules.test.ts` (1 test, Phases 4 and 6, about 105 seconds): with eight member workers running, it shows:
 - a capsule locked under an attested bucket key is privately released at the next handover and decrypts;
 - requests are refused from another wallet, before opening, for a second key and after expiry;
 - a capsule reusing another's u under its own policy is refused by every holder, without errors;
 - the deposit is refunded;
-- after its last handover the expired capsule's bucket is held by nobody and re-dealt by nobody.
+- after its last handover the expired capsule's bucket is held by nobody and re-dealt by nobody;
+- liveness: members go silent through one handover so that as few seats as possible, but at least t, speak. Every worker reports the resulting margin, the sender refuses to lock below its minimum, and the margin recovers after the next full handover.
 
 `test/epoch-stake.test.ts` (1 test, Phase 5, about 80 seconds): ten member workers, eight with bonds of 1–6 Algo, run ten committees.
 - **Seats track bonds:** each member's seat count lies within 4 standard deviations of the expectation from its tickets, and the fit's slope is between 0.8 and 1.2.

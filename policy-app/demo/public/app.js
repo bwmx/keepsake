@@ -78,8 +78,8 @@ function renderEpoch() {
   view($('eFacts')).html = [[e.inOffice, `seats in committee ${e.epoch}`], [e.posted, 'messages posted'], [e.nominated, `seats nominated for ${e.epoch + 1}`], [state.env.t, 'threshold t']]
     .map(([v, l]) => `<div class="fact"><b>${v}</b><span>${l}</span></div>`).join('');
   view($('history')).html = state.history.length
-    ? `<table class="hist"><tr><th>Handover</th><th>Messages</th><th>Buckets held after</th><th>Agree</th></tr>${state.history.map(h =>
-      `<tr><td>${h.committee} → ${Number(h.committee) + 1}</td><td>${h.messages}</td><td>${h.buckets.map(b => `<span class="mono" title="public key ${esc(b.key)}…">b${b.bucket}</span>`).join(' ') || '–'}${h.lost ? ` <span class="pill bad">lost ${esc(h.lost)}</span>` : ''}</td><td>${h.agree ? '✓' : '✗'}</td></tr>`).join('')}</table>`
+    ? `<table class="hist"><tr><th>Handover</th><th>Messages</th><th title="Valid dealings beyond t, for the worst bucket: at 0, one more silent seat loses buckets">Margin</th><th>Buckets held after</th><th>Agree</th></tr>${state.history.map(h =>
+      `<tr><td>${h.committee} → ${Number(h.committee) + 1}</td><td>${h.messages}</td><td>${h.margin <= 0 ? `<span class="pill bad">${h.margin}</span>` : h.margin}</td><td>${h.buckets.map(b => `<span class="mono" title="public key ${esc(b.key)}…">b${b.bucket}</span>`).join(' ') || '–'}${h.lost ? ` <span class="pill bad">lost ${esc(h.lost)}</span>` : ''}</td><td>${h.agree ? '✓' : '✗'}</td></tr>`).join('')}</table>`
     : '<p class="note">No handover processed yet.</p>';
 }
 

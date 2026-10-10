@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { microAlgo } from '@algorandfoundation/algokit-utils';
 import { generateEphemeralKey, type EncryptedPayload } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/crypto.js';
 import { VerifyPool } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/parallel.js';
-import { CAPSULE_DEPOSIT, bucketKey, capsuleLabel, openCapsule, sealCapsule } from '../src/epoch-capsules.js';
+import { CAPSULE_DEPOSIT, assertLive, bucketKey, capsuleLabel, openCapsule, sealCapsule } from '../src/epoch-capsules.js';
 import { bondAt, windows } from '../src/epochs.js';
 import { algorand, deploy, lastRound, startWorkers, stepAll, type Env, type WorkerEvent, type Workers } from '../src/epoch-sim.js';
 
@@ -102,8 +102,9 @@ function narrate() {
     const who = `Member #${e.member}`;
     if (e.received) {
       once(`r${e.received}`, () => say(`Committee ${e.received} handed over to committee ${BigInt(String(e.received)) + 1n}: ${e.messages} messages checked by every member. ` +
-        `Buckets now held: ${String(e.keys).split(',').filter(Boolean).map(kv => kv.split(':')[0]).join(', ') || 'none'}.${e.lost ? ` LOST: ${e.lost}.` : ''}`,
-      { tone: e.lost ? 'bad' : 'ok' }));
+        `Buckets now held: ${String(e.keys).split(',').filter(Boolean).map(kv => kv.split(':')[0]).join(', ') || 'none'}.${e.lost ? ` LOST: ${e.lost}.` : ''}` +
+        (Number(e.margin) <= 0 && !e.lost ? ' Margin 0: one more silent seat would have lost buckets, so new capsules are refused until it recovers.' : ''),
+      { tone: e.lost ? 'bad' : Number(e.margin) <= 0 ? 'warn' : 'ok' }));
     }
     if (e.seat) say(`${who} found it holds seat ${e.number} of committee ${e.seat} (trial decryption; nobody else knows).`, { private: true });
     if (e.posted) say(`${who} spoke once for committee ${e.posted} seat ${e.number}: re-sharings${e.releases ? `, partials for capsule ${e.releases}` : ''}. Its shares are erased.`, { private: true });
@@ -128,7 +129,7 @@ async function state() {
   const received = events.filter(e => e.received);
   const history = [...new Set(received.map(e => String(e.received)))].slice(-6).reverse().map(c => {
     const views = received.filter(e => e.received === c);
-    return { committee: c, messages: Number(views[0]!.messages), lost: String(views[0]!.lost), agree: new Set(views.map(v => v.keys)).size === 1,
+    return { committee: c, messages: Number(views[0]!.messages), margin: Number(views[0]!.margin), lost: String(views[0]!.lost), agree: new Set(views.map(v => v.keys)).size === 1,
       buckets: String(views[0]!.keys).split(',').filter(Boolean).map(kv => ({ bucket: kv.split(':')[0], key: kv.split(':')[1]!.slice(0, 10) })) };
   });
   const list = [];
@@ -148,7 +149,7 @@ async function state() {
       inOffice: office.length, posted: office.filter(s => s.value.finalized).length, nominated: next.length },
     history,
     members: (await env.reader.members()).map((m, i) => ({ index: i, address: m.account.toString(), online: !offline.has(i),
-      bond: Number(bondAt(m, epoch)) / 1e6, seats: workers![i]!.view(epoch)?.holders.length ?? 0,
+      bond: Number(bondAt(m, epoch)) / 1e6, seats: workers![i]!.view(epoch)?.seats.length ?? 0,
       nominated: next.filter(s => s.nominator === BigInt(i)).length })),
     capsules: list,
     narration: narration.slice(-200),
@@ -164,6 +165,7 @@ const find = (id: string) => {
 /** Locks a capsule under the bucket of its expiry round, using that bucket's key from the latest attested state. */
 async function lock(o: { message: string; openIn: bigint; length: bigint; from: Account; to: Account; copy?: DemoCapsule }) {
   const e = env!, round = await lastRound();
+  await assertLive(e.reader, round, settings.t, 1); // Refuse while one more silent seat would lose every bucket.
   const open = round + o.openIn, expires = open + o.length, bucket = expires / e.params.bucketRounds;
   const key = await bucketKey(e.reader, bucket, settings.t, round / E - 1n);
   if (!key) throw new Error(`Bucket ${bucket}'s key is not attested yet: let the clock run (keys appear about two epochs after a bucket is created).`);

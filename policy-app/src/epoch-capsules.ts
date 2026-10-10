@@ -2,9 +2,9 @@ import { createHash } from 'node:crypto';
 import { ALGORAND_ZERO_ADDRESS_STRING, decodeAddress, encodeUint64 } from 'algosdk';
 import { check, decryptPayload, encode, encryptPayload, open, type EncryptedPayload } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/crypto.js';
 import { decodeState, messageEntries, openCapsuleKey, sealCapsuleKey, stateDigest, type Public } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/ecpss.js';
-import { decodeG1, decodePartial, type G1Point, type Proof } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/pvss.js';
+import { decodeG1, decodePartial, decodeProof, encodeProof, type G1Point } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/pvss.js';
 import { b64url, hex, type ChainPins } from './chain.js';
-import type { CapsuleRecord, EpochReader } from './epochs.js';
+import { windows, type CapsuleRecord, type EpochReader, type OrderedSeat } from './epochs.js';
 
 /**
  * Capsules on bucket keys (PAPER_ALIGNMENT_PLAN.md Phase 4): the label binding a capsule's KEM proof to its policy, the
@@ -13,8 +13,6 @@ import type { CapsuleRecord, EpochReader } from './epochs.js';
 
 const u64 = (n: bigint) => Buffer.from(encodeUint64(n));
 const sha = (...parts: Uint8Array[]) => { const h = createHash('sha256'); for (const p of parts) h.update(p); return h.digest(); };
-const scalar = (x: bigint) => Buffer.from(x.toString(16).padStart(64, '0'), 'hex');
-const big = (b: Uint8Array) => BigInt(`0x${Buffer.from(b).toString('hex')}`);
 
 /**
  * The capsule's label: its KEM proof, payload key and payload AAD are bound to it. It covers the sender, so a u copied
@@ -29,15 +27,21 @@ export const releaseContext = (pins: ChainPins, capsuleId: bigint, requestId: Ui
   'ecpss/release/v1', pins.genesisHash, pins.appId.toString(), capsuleId.toString(), b64url(requestId), committee.toString(), seat,
 ]);
 
-export const proofBytes = (p: Proof) => Buffer.concat([scalar(p.c), scalar(p.z)]);
-export const proofFromBytes = (b: Uint8Array): Proof => ({ c: big(b.subarray(0, 32)), z: big(b.subarray(32, 64)) });
+export const proofBytes = encodeProof;
+export const proofFromBytes = decodeProof;
 export const payloadHash = (p: EncryptedPayload) => sha(encode(['ecpss/payload/v1', p.nonce, p.ciphertext, p.tag]));
+
+/** How many claimed seats attest each state digest (hex). */
+const attestations = (seats: OrderedSeat[]) => {
+  const counts = new Map<string, number>();
+  for (const s of seats) if (s.value.holder !== ALGORAND_ZERO_ADDRESS_STRING) counts.set(hex(s.value.stateDigest), (counts.get(hex(s.value.stateDigest)) ?? 0) + 1);
+  return counts;
+};
 
 /** Committee c's public state as at least t of its holders attested it when claiming their seats. */
 export async function attestedState(reader: EpochReader, committee: bigint, t: number): Promise<Public | undefined> {
-  const seats = await reader.seats(committee), counts = new Map<string, number>();
-  for (const s of seats) if (s.value.holder !== ALGORAND_ZERO_ADDRESS_STRING) counts.set(hex(s.value.stateDigest), (counts.get(hex(s.value.stateDigest)) ?? 0) + 1);
-  const agreed = [...counts].find(([, n]) => n >= t)?.[0]; // Fewer than t holders are corrupt, so one honest one agrees.
+  const seats = await reader.seats(committee);
+  const agreed = [...attestations(seats)].find(([, n]) => n >= t)?.[0]; // Fewer than t holders are corrupt, so one honest one agrees.
   if (!agreed) return undefined;
   const n = (await reader.seats(committee + 1n)).length;
   for (const bytes of (await reader.messages(committee, seats)).values()) {
@@ -56,6 +60,26 @@ export async function bucketKey(reader: EpochReader, bucket: bigint, t: number, 
     if (poly) return poly[0];
   }
   return undefined;
+}
+
+/**
+ * Liveness margin at `round` (PAPER_ALIGNMENT_PLAN.md Phase 6): by how many seats the latest handover's agreeing
+ * attestations, and the sizes of the committee in office and of the next one once nominated, exceed t. A handover
+ * with fewer than t honest seats speaking loses every live bucket. Undefined before the first handover.
+ */
+export async function livenessMargin(reader: EpochReader, round: bigint, t: number): Promise<number | undefined> {
+  const p = reader.params, epoch = round / p.epochRounds;
+  const latest = round > windows(p, epoch).handover[1] ? epoch : epoch - 1n;
+  if (latest < p.genesisCommittee) return undefined;
+  const counts = [Math.max(0, ...attestations(await reader.seats(latest)).values()), (await reader.seats(latest + 1n)).length];
+  if (round >= windows(p, latest + 1n).nominate[1]) counts.push((await reader.seats(latest + 2n)).length);
+  return Math.min(...counts) - t;
+}
+
+/** Sender: refuses to lock while the liveness margin is below `minMargin` seats. Choose it per deployment. */
+export async function assertLive(reader: EpochReader, round: bigint, t: number, minMargin: number) {
+  const margin = await livenessMargin(reader, round, t);
+  check(margin !== undefined && margin >= minMargin, `Liveness margin too thin (${margin ?? 'no handover yet'} < ${minMargin} seats): not locking`);
 }
 
 /** Sender: encrypts under the bucket key for this label. The payload stays off-chain; its hash is anchored. */

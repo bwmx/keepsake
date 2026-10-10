@@ -5,11 +5,11 @@ import { microAlgo } from '@algorandfoundation/algokit-utils';
 import { generateEphemeralKey } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/crypto.js';
 import { messageEntries } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/ecpss.js';
 import { VerifyPool } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/parallel.js';
-import { CAPSULE_DEPOSIT, attestedState, bucketKey, capsuleLabel, openCapsule, sealCapsule } from '../src/epoch-capsules.js';
+import { CAPSULE_DEPOSIT, assertLive, attestedState, bucketKey, capsuleLabel, livenessMargin, openCapsule, sealCapsule } from '../src/epoch-capsules.js';
 import { windows } from '../src/epochs.js';
-import { algorand, deploy, lastRound, rejects, runUntil, startWorkers, type WorkerEvent } from './epoch-env.js';
+import { algorand, deploy, lastRound, rejects, runUntil, startWorkers, stepAll, type WorkerEvent } from './epoch-env.js';
 
-test('capsules on bucket keys: private release from handover messages; refusals; a bucket is gone after its last handover', async () => {
+test('capsules on bucket keys: private release from handover messages; refusals; a bucket is gone after its last handover; senders refuse a thin liveness margin', async () => {
   const E = 120n, t = 3;
   const env = await deploy({ members: 8, epochRounds: E, nominationRounds: 40n, handoverRounds: 60n, threshold: 2n ** 64n - 1n,
     // A long lead: a bucket is created early enough to be attested (one epoch later) before capsules need its key.
@@ -20,7 +20,8 @@ test('capsules on bucket keys: private release from handover messages; refusals;
   const workers = await startWorkers(env, pool, events);
   const epoch = async () => (await lastRound()) / E;
   /** Registers a capsule opening `openIn` rounds from now, once the latest attested state holds its bucket's key. */
-  const register = async (o: { from?: typeof sender; openIn: bigint; length: bigint; to?: typeof recipient; copy?: { u: Uint8Array; proof: Uint8Array } }) => {
+  const register = async (o: { from?: typeof sender; openIn: bigint; length: bigint; to?: typeof recipient; copy?: { u: Uint8Array; proof: Uint8Array };
+    minMargin?: number }) => {
     const from = o.from ?? sender, to = o.to ?? recipient;
     let open: bigint, expires: bigint, bucket: bigint, key: Awaited<ReturnType<typeof bucketKey>>;
     for (;;) { // Waiting may move the window into the next bucket: recompute until the key is at hand.
@@ -30,6 +31,7 @@ test('capsules on bucket keys: private release from handover messages; refusals;
       if ((key = await bucketKey(env.reader, bucket, t, (await epoch()) - 1n))) break;
       await runUntil(env, workers, async () => !!(await bucketKey(env.reader, bucket, t, (await epoch()) - 1n)));
     }
+    await assertLive(env.reader, await lastRound(), t, o.minMargin ?? 1); // By default, refuse when one more silent seat would lose buckets.
     const label = capsuleLabel(env.app.appId, { sender: from.toString(), recipient: to.toString(), openRound: open, expiresRound: expires });
     const sealed = sealCapsule(key, label, plaintext);
     const id = (await env.app.send.registerCapsule({ sender: from, args: {
@@ -86,6 +88,26 @@ test('capsules on bucket keys: private release from handover messages; refusals;
     for (const bytes of (await env.reader.messages(after, await env.reader.seats(after))).values()) {
       assert.ok(!messageEntries(bytes, n, t).some(e => e.kind === 0 && e.id === a.bucket), 'nobody re-deals the dropped bucket');
     }
+
+    // Liveness: members go silent through one handover window, leaving as few seats speaking as possible, but at least
+    // t (exactly t when some set of members holds exactly t seats). Workers report the margin, and senders refuse to
+    // lock while it is below their minimum, until a full handover restores it.
+    const quiet = (await epoch()) + 1n, w = windows(env.params, quiet);
+    await runUntil(env, workers, async () => (await lastRound()) + 1n >= w.handover[0]);
+    const seatsHeld = workers.map(x => x.view(quiet)?.seats.length ?? 0), total = (set: number[]) => set.reduce((a, i) => a + seatsHeld[i]!, 0);
+    let speakers = [...seatsHeld.keys()];
+    for (let mask = 1; mask < 1 << seatsHeld.length; mask++) {
+      const set = [...seatsHeld.keys()].filter(i => mask & (1 << i));
+      if (total(set) >= t && total(set) < total(speakers)) speakers = set;
+    }
+    const margin = total(speakers) - t;
+    while ((await lastRound()) < w.handover[1]) await stepAll(env, workers, i => speakers.includes(i));
+    await runUntil(env, workers, () => events.some(e => e.received === quiet.toString()));
+    assert.ok(events.filter(e => e.received === quiet.toString()).every(e => e.margin === margin.toString() && e.lost === ''));
+    assert.equal(await livenessMargin(env.reader, await lastRound(), t), margin);
+    await rejects(register({ openIn: 5n, length: 3n * E, minMargin: margin + 1 }), 'Liveness margin too thin');
+    await runUntil(env, workers, () => events.some(e => e.received === (quiet + 1n).toString()));
+    assert.ok((await livenessMargin(env.reader, await lastRound(), t))! > margin);
   } finally {
     await Promise.all(workers.map(w => w.stop()));
     await pool.close();

@@ -61,7 +61,10 @@ export class VerifyPool {
   }
 }
 
-/** `receive` from raw message bytes, verified on the pool. Undecodable or invalid messages count as absent. */
+/**
+ * `receive` from raw message bytes, verified on the pool. Undecodable or invalid messages count as absent. Also returns
+ * every valid dealer per bucket (the handover's liveness margin is how far each list exceeds t).
+ */
 export async function receiveParallel(pool: VerifyPool, raw: Map<number, Uint8Array>, pub: Public, committee: bigint, buckets: Buckets,
   next: G2Point[], t: number, mine: { seat: number; x: bigint }[] = []) {
   const seats = [...raw.keys()].sort((a, b) => a - b);
@@ -76,5 +79,5 @@ export async function receiveParallel(pool: VerifyPool, raw: Map<number, Uint8Ar
   for (const [b, list] of results.flat()) valid.set(BigInt(b), [...(valid.get(BigInt(b)) ?? []), ...list].sort((x, y) => x - y));
   const chosen = new Set([...valid.values()].flatMap(list => list.slice(0, t)));
   const messages = new Map([...chosen].map(s => [s, decodeMessage(raw.get(s)!, s, next.length, t, mine.map(m => m.seat))]));
-  return adopt(messages, valid, buckets, t, mine);
+  return { ...adopt(messages, valid, buckets, t, mine), valid };
 }

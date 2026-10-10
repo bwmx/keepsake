@@ -1,6 +1,6 @@
 # Paper alignment plan
 
-Drafted 2026-10-09; Phases 0–4 done the same day, Phase 5 on 2026-10-10. This is a design proposal; no cryptographer has reviewed it yet, and none of it is implemented except where marked done. It aims to move the demo from one hidden committee per capsule to the paper's evolving-committee proactive secret sharing (ECPSS, [eprint 2020/464](https://eprint.iacr.org/2020/464) §3) on Algorand. The stack stays the same: Puya TS contract, TypeScript off-chain. Section numbers (§) refer to the paper.
+Drafted 2026-10-09; Phases 0–4 done the same day, Phase 5 and most of Phase 6 on 2026-10-10 (TestNet not started). This is a design proposal; no cryptographer has reviewed it yet, and none of it is implemented except where marked done. It aims to move the demo from one hidden committee per capsule to the paper's evolving-committee proactive secret sharing (ECPSS, [eprint 2020/464](https://eprint.iacr.org/2020/464) §3) on Algorand. The stack stays the same: Puya TS contract, TypeScript off-chain. Section numbers (§) refer to the paper.
 
 ## Where we are
 
@@ -291,6 +291,35 @@ In the first run the 6-Algo member came out 2.4 standard deviations low; the nex
 - **VRF work grows with stake.** A member computes one VRF per ticket per epoch, up to `totalTickets` for the whole stake.
 - **Not tried on TestNet.** Real stake distributions and how often bonds change are untested.
 
+## Phase 6 results (erasure and liveness done 2026-10-10; TestNet not started)
+
+**Erasure: one short-lived process per committee's secrets.** `SeatVault` is in `crypto-spike/src/vault.ts`, and the epoch worker uses it.
+- **Contents.** A member starts a vault when it posts the nomination key for an epoch. The vault holds:
+  - that key, as a random 32-byte seed in a buffer we wipe; the X25519 key is derived from it only to open seats;
+  - the seats' one-time keys;
+  - the shares, combined from the dealings everyone chose.
+- **Work.** The vault builds its seats' messages, capsule releases and claim signatures.
+- **Erase before speaking.** The vault exits before any of its seats claims or posts, so the paper's rule now holds at the process level. A vault whose member holds no seat exits once the seats are opened. A member has at most three vaults alive: for the committee in office, the next, and the one after.
+- **The worker's view.** It sees public data, its own seat numbers, and what it posts. Verification stays on the shared thread pool, which only ever handles public data.
+- **Host checks.** Vaults start under `ulimit -c 0`, checked from inside. They refuse to start where swap is unencrypted (macOS, via `vm.swapusage`) or on at all (Linux, `/proc/swaps`; `ECPSS_ALLOW_SWAP=1` overrides). A test shows a vault refusing to start with core dumps enabled.
+- **Cost.** A vault idles at about 61 MiB of resident memory, mostly Node itself, and 30 start in 260 ms. Loading the app client too would cost 74 MiB, so the worker passes in the bytes to sign and the HPKE contexts instead.
+- **Not provable.** JavaScript can neither wipe bigints nor lock pages, so the process exit is what ends a secret. The operating system keeps freed pages until it reuses them, and a hibernation image or a compromised host still sees everything.
+- **Audit mode (tests only).** Vaults report their shares, so the Phase 3 test can still check that a bucket's secret never changes.
+
+**Liveness.**
+- **Workers** report each handover's margin: by how many valid dealings the worst kept bucket exceeds t.
+- **Senders** measure the margin from public data: the latest handover's agreeing attestations, the committee in office, and the next committee once nominated, each against t. `assertLive` refuses to lock a capsule below a chosen minimum, and Capsule Lab refuses at 0.
+- **Test.** In `test/epoch-capsules.test.ts`, members go silent through one handover so that as few seats as possible, but at least t, speak. Every worker reports the resulting margin, the sender refuses below its minimum, and the margin recovers after the next full handover.
+- **Limit.** The margin is seen after a handover. It warns senders and protects new capsules; it cannot rescue buckets already at risk.
+
+**Infrastructure.**
+- **Member CLI.** `node dist/src/epoch-worker.js` runs one member against its own algod node, configured by environment variables. It checks the host before starting. Smoke test: three CLI members, each its own process polling LocalNet, ran three handovers with margin 1 and no errors.
+- **TestNet not started.** It needs four decisions or inputs:
+  1. deployment parameters: Phase 0 suggests C = 130, t = 50, which needs a bonded population in the thousands for the anonymity assumptions;
+  2. funded TestNet accounts for the creator and members, with bonds;
+  3. one node and host per member;
+  4. a check that TestNet's consensus allows the extended app-call arguments (16,384 bytes) and charges the per-byte fee measured on LocalNet algod 5.0.1. If it does not, each call carries about 3 KB, and an epoch needs about 7 times as many calls.
+
 ## Crypto sketch for D2 (review before implementing)
 
 This works in BLS12-381 with generators g1 ∈ G1 and g2 ∈ G2 and pairing e. The secret is the group element S = s·g2. The public key is P = s·g1.
@@ -371,7 +400,7 @@ Precedents: pairing-based PVSS in SCRAPE (Cascudo and David, 2017), and group-el
 - Seats are proportional to online stake (Algorand-style binomial sortition, verified on-chain). Members fund their own boxes, and the admin gate goes away.
 - Done when seat counts track stake over many epochs and accounts with no online stake can't nominate.
 
-**Phase 6: hardening and TestNet. Size: medium.**
+**Phase 6: hardening and TestNet. Erasure and liveness done 2026-10-10; TestNet not started; see Phase 6 results.**
 - **Erasure.** Keep key bytes in buffers we control instead of non-extractable WebCrypto keys, use one short-lived process per epoch's secrets, and disable swap and core dumps. Erasure is still not provable.
 - **Liveness.** Track the count of valid messages against t, and refuse new capsules when the margin is thin. A failed handover loses every live bucket.
 - **Infrastructure.** Give each member its own algod node, then run on TestNet with real fees and timings.
@@ -387,7 +416,7 @@ Precedents: pairing-based PVSS in SCRAPE (Cascudo and David, 2017), and group-el
 | One committee per capsule; honest dealer per capsule | Phases 1, 2 and 4 (bucket DKG; done) |
 | Stake weighting | Phase 5 (done) |
 | Single-operator beacon | Phase 1 (block seed; done) |
-| Best-effort erasure | Phase 6 (better, not provable) |
+| Best-effort erasure | Phase 6 (per-committee vault processes; done, still not provable) |
 | Relayer for custody traffic | Phase 3 (speak once from own account; done) |
 
 ## Open questions for review
