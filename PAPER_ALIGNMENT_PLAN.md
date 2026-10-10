@@ -329,6 +329,18 @@ In the first run the 6-Algo member came out 2.4 standard deviations low; the nex
   - **Fees.** 0.56 Algo over five epochs for five seats, about 0.02 Algo per seat per epoch. Nominations cost the most (0.01 Algo each, for the VRF check's opcode budget), then claims (0.004 Algo each, for the signature check). Chunks cost 0.0014 Algo each at these small message sizes.
   - **Cost to the funder.** 1.43 Algo net: fees, the enrollment deposits (there is no exit) and the app's own deposits. Bonds, seat and capsule deposits and account balances all came back, and the throwaway accounts were closed to the funder.
   - **Not shown.** Committees of the planned size (130), a real stake distribution, members on their own nodes, fees under congestion, and adversarial members.
+- **60-seat TestNet trials (2026-10-10 and 2026-10-11).** Five members holding 60 seats per committee (12 each): t = 20, 150-round epochs (15 rounds for nominations, 40 for the handover), all through the same public node. It took three runs.
+  1. **App 774022281: the genesis committee never spoke.** The node answered 429 (Too Many Requests) to the reader's unbounded parallel box reads, 60 per committee per member. The worker then skipped stages after errors instead of retrying them, and the polling loop swallowed the errors. Fixed: the reader reads at most 8 boxes at a time, and a stage counts as done only once it succeeds. A bug in the trial's cleanup then used the default epoch length and closed accounts that still owned seats, stranding 17.32 TestNet Algo in that app for good: 120 seat deposits, the enrollment deposits and the app's minimum. Fixed: cleanup reads the app's epoch length, closes an account only once none of its seats remain, and keeps the state file otherwise.
+  2. **App 774029608: every handover held, but seats posted late.** Posting a seat took three confirmed transactions (claim, chunks, finalize), four seats at a time. Only 55, 41, 34 and 50 of 60 messages made the 40-round window (margins 35, 21, 14 and 30). The capsule still opened 142 s after its request. Fees were 5.77 Algo over four epochs; net cost 6.68 Algo.
+  3. **App 774037027: claim, chunks and finalize in one atomic group per seat.**
+     - **Handovers.** All four posted 60 of 60 messages (margin 40). The last post landed 29–31 rounds into the window, and members finished verifying 17–48 rounds after it.
+     - **Data.** About 47 KB per message, 2.6–2.85 MiB per handover.
+     - **Capsule.** Opened 138 s after its request.
+     - **Fees.** 5.54 Algo over four epochs, about 0.023 Algo per seat per epoch. Nominations took 54% (0.01 Algo each, for the VRF check). Claims dropped to 0.001 Algo, because the group's pooled budget covers the signature check.
+     - **Net cost.** 6.45 Algo; bonds, seat deposits and accounts were all recovered.
+  - **Since then.** A network error while posting used to cost a member that attempt's seats: the vault has exited, so only the built messages remain. The worker now keeps them and retries within the window, checking whether an earlier atomic group landed. This passes LocalNet but has not yet been seen on TestNet.
+  - **Bottleneck.** Rounds stayed at 2.69 s, so the network itself was never the bottleneck: the shared node's rate limit was. With members on their own nodes there is no rate limit to hit.
+  - **Funder.** All TestNet trials so far took about 33 Algo: 1.43, then 18.7 (17.32 of it stranded), then 6.68 and 6.45.
 - **Full-size TestNet deployment not started.** It needs:
   1. deployment parameters: Phase 0 suggests C = 130, t = 50, which needs a bonded population in the thousands for the anonymity assumptions;
   2. one node and host per member.
@@ -438,7 +450,17 @@ Precedents: pairing-based PVSS in SCRAPE (Cascudo and David, 2017), and group-el
 - **E2 under receiver selective opening.** The paper requires RIND-SO, which plain ElGamal doesn't have a proof for.
 - **E1 anonymity.** HPKE over X25519 depends on the paper's unproven Conjecture 1.
 - **Real seed redraws.** How many re-draws do block-seed proposers actually get? This sets k1.
-- **Smaller committees.** Newer committee-size work might shrink C further: eprint 2026/919, "Towards Practical Committee Sizes in YOSO MPC", and 2026/1101, "Tail-Hammer". Only the titles have been seen so far; the papers haven't been read.
+  - *Partly answered (2026-10-10, from abstracts).* Ferreira et al. (EC '24, [arXiv:2406.15282](https://arxiv.org/abs/2406.15282)) bound how far a strategic staker can raise its share of leader rounds in Algorand-style self-selection: to between 10.08% and 10.15% for a 10% staker. Withholding leaves only a few choices per round the adversary leads, so the 2^8 redraws assumed here look conservative.
+  - The cost of the margin is small: dropping it entirely only moves the 2^-64 row at f = 5% from C = 210 to C = 198. Keep k1 = 8 until the live seed design (seed refresh and lookback) is analysed directly.
+- **Smaller committees.** Two newer papers, checked 2026-10-10 from their abstracts only:
+  - **[eprint 2026/919](https://eprint.iacr.org/2026/919)**, "Towards Practical Committee Sizes in YOSO MPC" (Kędzior, Mielniczuk, Venturi; CRYPTO 2026). It reaches committees of about 100, tolerating any constant corruption fraction f < 1, with a 70–80% improvement over Benhamouda et al. It needs four things:
+    - identifiable aborts through time-lock puzzles;
+    - penalties backed by public fraud proofs;
+    - sortition with a fixed, not just expected, committee size;
+    - a tighter corruption analysis.
+
+    That is a different model from ours, based on accountability. Phase 5's bonds could carry the penalties: a seat's holder is known once it claims, and an invalid dealing is publicly checkable. A silent seat cannot be attributed without something like time-lock puzzles. Fixed-size sortition would also remove the committee-size variance our tails pay for. **Worth a design spike; not started.**
+  - **[eprint 2026/1101](https://eprint.iacr.org/2026/1101)**, "Tail-Hammer" (David, Lavagnino, Pagnin, Stankovski Wagner). Exact parameters for VRF-selected anonymous committees, about 25% smaller than Blum et al.'s (CCS '23) estimates. It takes the same approach as our exact-tail calculator (`npm run params`), so it does not shrink our numbers further. Its finite-population binomial treatment could replace our N ≫ C Poisson limit, which is conservative.
 
 ## Kept and removed
 

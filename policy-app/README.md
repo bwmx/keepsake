@@ -16,7 +16,7 @@ This package is the Algorand side of [the paper alignment plan](../PAPER_ALIGNME
 | `demo/` | **Capsule Lab**: a local web UI for the design |
 | `smart_contracts/broadcast_probe/`, `bench/broadcast-probe.ts` | Phase 0 probe: argument and note limits and fees, an epoch of handover data posted and rebuilt from blocks, block-seed lookback, stake opcodes (`npm run probe`) |
 | `bench/browser-check.ts` | Capsule Lab in headless Chrome (`npm run browser-check`, LocalNet). It starts its own server and drives the page through the whole capsule flow, the operator view, a member outage, phone width and dark mode, and fails on any page error. Screenshots go to the git-ignored `browser-shots/`; `CHROME_PATH` overrides the browser |
-| `bench/testnet-trial.ts` | Phase 6 TestNet trial (`npm run trial`, TestNet only). It funds five throwaway members from `TESTNET_MNEMONIC` in `../.env` (git-ignored) and runs them through a public node. It runs handovers and a capsule round trip, reports timings and fees, then returns what it can to the funder. Keys of an interrupted run are kept in the git-ignored `.testnet-trial.json`; `npm run trial -- cleanup` recovers them |
+| `bench/testnet-trial.ts` | Phase 6 TestNet trial (`npm run trial`, TestNet only). It funds throwaway members from `TESTNET_MNEMONIC` in `../.env` (git-ignored) and runs them through a public node. It runs handovers and a capsule round trip, reports timings, data and fees, then returns what it can to the funder. The sizes are set by `TRIAL_MEMBERS`, `TRIAL_TICKETS` (seats per committee), `TRIAL_T`, `TRIAL_EPOCH`, `TRIAL_NOMINATION`, `TRIAL_HANDOVER`, `TRIAL_LEAD_EPOCHS`, `TRIAL_BOND` and `TRIAL_FUND`. Keys of an interrupted run are kept in the git-ignored `.testnet-trial.json`, and `npm run trial -- cleanup` recovers them. Cleanup closes an account only once none of its seats remain |
 
 It runs on LocalNet, and a five-member trial has run on TestNet. All cryptography stays in the [crypto spike](../crypto-spike/README.md). The earlier per-capsule design (`CapsulePolicy`, beacon-seeded slots and a relayer) was removed on 2026-10-10; it is in the Git history before that date.
 
@@ -82,7 +82,8 @@ The member worker ([`src/epoch-worker.ts`](src/epoch-worker.ts)) handles each ep
 - **Keys.** It posts its nomination keys.
 - **Nomination.** It reads its weight as the contract does, draws a VRF for each of its tickets, and nominates one seat per winning ticket. Each seat is sealed to a member drawn by bond.
 - **Seats.** It opens its seats when nominations close, then erases that epoch's key.
-- **Handover.** As a holder, it builds its single handover message and its secrets are erased. Then it claims the seat and posts the message from its own account. There is no relayer.
+- **Handover.** As a holder, it builds its single handover message and its secrets are erased. Then it posts each seat from its own account as one atomic group: claim, message chunks and finalize. That is one round per seat for messages up to 14 chunks (about 280 KB). Seats go four at a time. There is no relayer.
+- **Retries.** A stage counts as done only once it succeeds. A node error, such as a public node's rate limit, means it is retried at the next step, never skipped. The reader fetches at most eight boxes at a time.
 - **Processing.** It processes every closed handover in order and catches up after an outage. Messages are verified on a shared thread pool (`VerifyPool` from the crypto spike), and it combines shares for its seats in the next committee.
 - **Cleanup.** It deletes the seats it nominated three committees back and recovers their deposits.
 - **Liveness.** Each `received` event reports the handover's margin: by how many valid dealings the worst kept bucket exceeds t.

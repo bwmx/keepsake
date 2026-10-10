@@ -7,7 +7,7 @@ import { check, seal } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/cr
 import { encodeState, seatKeys, stateDigest, type Public } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/ecpss.js';
 import { VerifyPool, receiveParallel } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/parallel.js';
 import { decodeG2, type G2Point } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/pvss.js';
-import { SeatVault } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/vault.js';
+import { SeatVault, type Post } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/vault.js';
 import { EpochCommitteeClient } from '../smart_contracts/artifacts/epoch_committee/EpochCommitteeClient.js';
 import { b64url, vrfRank, type ChainPins } from './chain.js';
 import { attestedState, capsuleLabel, releaseContext } from './epoch-capsules.js';
@@ -79,6 +79,8 @@ export async function startEpochWorker(cfg: EpochWorkerConfig) {
   const winning = new Map<bigint, { ticket: bigint; proof: Uint8Array }[]>(); // Committee → winning tickets not yet nominated.
   const ordered = new Map<bigint, OrderedSeat[]>(); // Committee → its seats in key order (public).
   const seats = new Map<bigint, MySeat[]>(); // Committee → the seats this member holds in it (operator-local).
+  // Committee → messages built for its handover but not yet on chain (public once posted; no secrets).
+  const unposted = new Map<bigint, { posts: (Post & MySeat & { tried: boolean })[]; digest: Uint8Array }>();
   type Audit = { seat: number; shares: Map<bigint, G2Point> }[];
   const views = new Map<bigint, { pub: Public; holders?: Audit }>(); // Committee → public state after the handover into it.
   let opened = params.genesisCommittee - 2n; // Last epoch whose nominations were opened (committee = epoch + 1).
@@ -120,13 +122,27 @@ export async function startEpochWorker(cfg: EpochWorkerConfig) {
       while (r >= bonds[i]!) r -= bonds[i++]!;
       return BigInt(i);
     };
-    while (wins.length) {
-      let nomineeKey: Uint8Array | undefined;
-      for (let tries = 0; !nomineeKey && tries < 64; tries++) nomineeKey = await reader.nominationKey(epoch, draw());
-      if (!nomineeKey) return;
-      await nominateTicket(committee, wins[0]!, nomineeKey);
-      wins.shift();
+    const done = new Set<bigint>();
+    try {
+      await inBatches([...wins], async win => {
+        let nomineeKey: Uint8Array | undefined;
+        for (let tries = 0; !nomineeKey && tries < 64; tries++) nomineeKey = await reader.nominationKey(epoch, draw());
+        if (!nomineeKey) return;
+        await nominateTicket(committee, win, nomineeKey);
+        done.add(win.ticket);
+      });
+    } finally {
+      winning.set(committee, wins.filter(w => !done.has(w.ticket))); // The rest are retried while the window lasts.
     }
+  }
+
+  /** Runs `f` over `items`, PARALLEL at a time: a member with many seats posts them together without flooding its node. */
+  async function inBatches<T>(items: T[], f: (item: T) => Promise<void>) {
+    const failures: unknown[] = [];
+    for (let i = 0; i < items.length; i += PARALLEL) {
+      for (const r of await Promise.allSettled(items.slice(i, i + PARALLEL).map(f))) if (r.status === 'rejected') failures.push(r.reason);
+    }
+    if (failures.length) throw failures[0];
   }
 
   async function nominateTicket(committee: bigint, win: { ticket: bigint; proof: Uint8Array }, nomineeKey: Uint8Array) {
@@ -171,6 +187,7 @@ export async function startEpochWorker(cfg: EpochWorkerConfig) {
 
   // Committee `epoch` hands over: one message per seat held, after rotating keys and erasing (§3.1.3 steps 4–5).
   async function handOver(epoch: bigint) {
+    if (unposted.has(epoch)) return postPending(epoch);
     const view = views.get(epoch), mine = seats.get(epoch), next = ordered.get(epoch + 1n), vault = vaults.get(epoch);
     // The rotation precedes speaking: wait for the next epoch's key.
     if (!view || !mine?.length || !next || !vault || !posted.has(epoch + 1n)) return;
@@ -189,45 +206,64 @@ export async function startEpochWorker(cfg: EpochWorkerConfig) {
         recipientKey: b64url(record.recipientKey), contexts: new Map(mine.map(m => [m.seat, releaseContext(cfg.pins, id, record.requestId, epoch, m.seat)])) })),
     }).finally(() => vault.close());
     await vault.exited; // Erase before speaking: the vault and every secret in it are gone.
-    for (const p of posts) {
-      const m = mine.find(x => x.seat === p.seat)!;
-      for (const [id, reason] of p.refused) event({ refused: id.toString(), reason });
-      await app.send.claim({ ...cover, args: { committee: epoch, nominator: m.nominator, ticket: m.ticket, holder: member.addr.toString(),
-        stateDigest: digest, signature: p.signature } });
-      await postMessage(app, member.addr.toString(), { committee: epoch, nominator: m.nominator, ticket: m.ticket }, p.message);
-      event({ posted: epoch.toString(), number: p.seat.toString(), releases: p.releases.join(',') });
+    for (const p of posts) for (const [id, reason] of p.refused) event({ refused: id.toString(), reason });
+    unposted.set(epoch, { posts: posts.map(p => ({ ...p, ...mine.find(x => x.seat === p.seat)!, tried: false })), digest });
+    await postPending(epoch);
+  }
+
+  // Posts the built messages not yet on chain, four seats at a time; each step retries the rest while the window lasts.
+  // A seat's claim, chunks and finalize form one atomic group, so a seat this member has claimed is fully posted.
+  async function postPending(epoch: bigint) {
+    const entry = unposted.get(epoch)!;
+    try {
+      await inBatches([...entry.posts], async p => {
+        // A retry first checks whether the earlier attempt landed with its reply lost.
+        const landed = p.tried && (await reader.seat(epoch, p)).holder === member.addr.toString();
+        p.tried = true;
+        if (!landed) {
+          await postMessage(app, member.addr.toString(), { committee: epoch, nominator: p.nominator, ticket: p.ticket }, p.message,
+            { holder: member.addr.toString(), stateDigest: entry.digest, signature: p.signature });
+        }
+        event({ posted: epoch.toString(), number: p.seat.toString(), bytes: p.message.length.toString(), releases: p.releases.join(',') });
+        entry.posts = entry.posts.filter(x => x !== p);
+      });
+    } finally {
+      if (!entry.posts.length) unposted.delete(epoch);
     }
   }
 
   // Everyone processes committee c's handover once its window is over, to follow the public commitments.
+  // It reads and verifies before changing any state, so a failed read (a node error) is simply retried next step.
   async function receiveHandover(c: bigint) {
     const view = views.get(c), next = ordered.get(c + 1n);
+    if (view && next) {
+      // Fresh seat records: the digests and finalized flags were written after the seats were opened.
+      const raw: Map<number, Uint8Array> = await reader.messages(c, await reader.seats(c)); // Missing or mismatched: absent.
+      const buckets = handoverBuckets(params, c), held = { live: buckets.live.filter(b => view.pub.has(b)), create: buckets.create };
+      const result = await receiveParallel(cfg.pool, raw, view.pub, c, held, next.map(s => decodeG2(s.value.epk)), t);
+      // The vault for committee c + 1 combines its seats' shares from the dealings everyone chose.
+      const vault = vaults.get(c + 1n), chosen = new Map([...new Set([...result.used.values()].flat())].map(s => [s, raw.get(s)!]));
+      const holders = await vault?.adopt(chosen, result.used, held, next.length, t).catch(e => { report('adopt')(e); closeVault(c + 1n); return undefined; });
+      views.set(c + 1n, { pub: result.pub, ...(holders ? { holders } : {}) });
+      // Liveness: how far the valid dealings for each kept bucket exceed t. At zero, one more silent seat loses buckets.
+      const counts = [...held.live, ...held.create].filter(b => !result.lost.includes(b)).map(b => (result.valid.get(b)?.length ?? 0) - t);
+      const margin = counts.length ? Math.min(...counts) : raw.size - t;
+      event({ received: c.toString(), messages: raw.size.toString(), lost: result.lost.join(','), margin: margin.toString(),
+        // Public: each bucket's key, so operators can see that all members agree and that keys never change.
+        keys: [...result.pub].map(([b, poly]) => `${b}:${b64url(poly[0]!.toBytes())}`).join(',') });
+    }
     views.delete(c);
+    ordered.delete(c);
+    unposted.delete(c); // The window is over: whatever did not get on chain stays silent.
     seats.delete(c); // Seats this member missed posting for (offline in their window): their vault goes too.
     closeVault(c);
-    if (!view || !next) return;
-    // Fresh seat records: the digests and finalized flags were written after the seats were opened.
-    const raw: Map<number, Uint8Array> = await reader.messages(c, await reader.seats(c)); // Missing or mismatched: absent.
-    const buckets = handoverBuckets(params, c), held = { live: buckets.live.filter(b => view.pub.has(b)), create: buckets.create };
-    const result = await receiveParallel(cfg.pool, raw, view.pub, c, held, next.map(s => decodeG2(s.value.epk)), t);
-    // The vault for committee c + 1 combines its seats' shares from the dealings everyone chose.
-    const vault = vaults.get(c + 1n), chosen = new Map([...new Set([...result.used.values()].flat())].map(s => [s, raw.get(s)!]));
-    const holders = await vault?.adopt(chosen, result.used, held, next.length, t).catch(e => { report('adopt')(e); closeVault(c + 1n); return undefined; });
-    views.set(c + 1n, { pub: result.pub, ...(holders ? { holders } : {}) });
-    ordered.delete(c);
-    // Liveness: how far the valid dealings for each kept bucket exceed t. At zero, one more silent seat loses buckets.
-    const counts = [...held.live, ...held.create].filter(b => !result.lost.includes(b)).map(b => (result.valid.get(b)?.length ?? 0) - t);
-    const margin = counts.length ? Math.min(...counts) : raw.size - t;
     // Each member deletes the seats it nominated KEEP committees back, recovering their deposits. Until then a member
     // that was offline can still catch up from the on-chain digests.
     const old = c - KEEP;
     if (old >= params.genesisCommittee) await deleteSeats(old).catch(report('cleanup'));
-    event({ received: c.toString(), messages: raw.size.toString(), lost: result.lost.join(','), margin: margin.toString(),
-      // Public: each bucket's key, so operators can see that all members agree and that keys never change.
-      keys: [...result.pub].map(([b, poly]) => `${b}:${b64url(poly[0]!.toBytes())}`).join(',') });
   }
 
-  const KEEP = 3n;
+  const KEEP = 3n, PARALLEL = 4;
   const report = (at: string) => (e: unknown) => event({ error: at, message: (e instanceof Error ? e.message : String(e)).split('\n')[0]!.slice(0, 200) });
 
   async function deleteSeats(c: bigint) {
@@ -262,16 +298,21 @@ export async function startEpochWorker(cfg: EpochWorkerConfig) {
     const round = await reader.lastRound(), epoch = round / E, w = windows(params, epoch);
     await postKeys(epoch, round >= w.nominate[1]).catch(report('keys')); // Raced with an epoch boundary: retried next step.
     if (round + 1n >= w.nominate[0] && round + 1n <= w.nominate[1]) await nominate(epoch).catch(report('nominate'));
-    // Catch up in order: seats are opened before the handover into them is processed.
-    while (opened + 1n < epoch || (opened + 1n === epoch && round >= w.nominate[1])) await openSeats(++opened);
+    // Catch up in order: seats are opened before the handover into them is processed. A stage counts as done only once
+    // it succeeds; one that fails (a node error) is retried at the next step, never skipped.
+    await (async () => {
+      while (opened + 1n < epoch || (opened + 1n === epoch && round >= w.nominate[1])) { await openSeats(opened + 1n); opened += 1n; }
+    })().catch(report('open'));
     if (round + 1n >= w.handover[0] && round + 1n <= w.handover[1]) await handOver(epoch).catch(report('handover'));
-    while (windows(params, processed + 1n).handover[1] <= round && processed + 1n <= opened) await receiveHandover(++processed);
+    await (async () => {
+      while (windows(params, processed + 1n).handover[1] <= round && processed + 1n <= opened) { await receiveHandover(processed + 1n); processed += 1n; }
+    })().catch(report('receive'));
   }
 
   let running = cfg.pollMs > 0;
   const loop = (async () => {
     while (running) {
-      await step().catch(e => { if (process.env.DEBUG) console.error(e instanceof Error ? e.message : e); });
+      await step().catch(report('step')); // E.g. the node unreachable or rate-limiting: tried again after pollMs.
       await sleep(cfg.pollMs);
     }
   })();

@@ -22,6 +22,13 @@ const sha = (...parts: Uint8Array[]) => { const h = createHash('sha256'); for (c
 const struct = (name: string) => ABIType.from(`(${APP_SPEC.structs[name]!.map(f => f.type).join(',')})`);
 const SEAT = struct('Seat'), MEMBER = struct('Member'), CAPSULE = struct('CapsuleRecord');
 
+/** `f` over `items`, at most `limit` at a time: a committee's worth of box reads at once trips public nodes' rate limits. */
+async function mapLimited<T, R>(items: T[], f: (item: T) => Promise<R>, limit = 8): Promise<R[]> {
+  const out: R[] = [];
+  for (let i = 0; i < items.length; i += limit) out.push(...await Promise.all(items.slice(i, i + limit).map(f)));
+  return out;
+}
+
 /** Inclusive round windows of epoch e: nominations for committee e + 1, then committee e's handover. */
 export const windows = (p: EpochParams, epoch: bigint) => {
   const start = epoch * p.epochRounds;
@@ -81,6 +88,7 @@ export const claimMessage = (appId: bigint, committee: bigint, nominator: bigint
 // A chunk is four argument parts and the note. Arguments total 16,384 bytes: selector 4 + three uint64 24 + four
 // 2-byte length prefixes 8 leave 16,348 bytes of data; the note holds 4,096.
 const ARG_OVERHEAD = 36, PART = 4_087, NOTE = 4_096;
+const SIG_BUDGET = 2_500; // The contract's ensureBudget before ed25519verify_bare in `claim`.
 export const CHUNK = 4 * PART + NOTE;
 
 /** The fee measured on LocalNet in Phase 0: 1,000 µAlgo plus 0.1 µAlgo per byte beyond 2,048 argument and 1,024 note bytes. */
@@ -94,19 +102,31 @@ const chunks = (message: Uint8Array) => Array.from({ length: Math.max(1, Math.ce
   return { parts, note: c.subarray(4 * PART) };
 });
 
-/** Posts a claimed seat's message in chunks (16 calls per group), then finalizes it. The caller is the seat's holder. */
-export async function postMessage(app: EpochCommitteeClient, sender: string, seat: SeatId & { committee: bigint }, message: Uint8Array) {
+/**
+ * Posts a seat's message in chunks and finalizes it, as the seat's holder. With `claim`, the seat is claimed first in
+ * the same atomic group: the claim sets the holder the chunks check. Up to 16 calls per group, so a message of up to 14
+ * chunks (about 280 KB) takes a single group: one round and one confirmation per seat.
+ */
+export async function postMessage(app: EpochCommitteeClient, sender: string, seat: SeatId & { committee: bigint }, message: Uint8Array,
+  claim?: { holder: string; stateDigest: Uint8Array; signature: Uint8Array }) {
   const { committee, nominator, ticket } = seat;
-  const calls = chunks(message);
+  type Group = ReturnType<EpochCommitteeClient['newGroup']>;
+  // The claim's signature check needs SIG_BUDGET; a group pools 700 opcodes per app call, and each budget top-up the
+  // contract adds is an inner call the claim's fee pays for.
+  const groupCalls = Math.min(16, 2 + chunks(message).length);
+  const claimFee = 1_000 * (1 + Math.max(0, Math.ceil((SIG_BUDGET + 110 - 700 * groupCalls) / 700)));
+  const calls: ((g: Group) => void)[] = [
+    ...(claim ? [(g: Group) => void g.claim({ sender, staticFee: microAlgo(claimFee), args: { committee, nominator, ticket, ...claim } })] : []),
+    ...chunks(message).map(({ parts, note }) => (g: Group) => void g.postChunk({ sender, note,
+      staticFee: microAlgo(chunkFee(ARG_OVERHEAD + parts.reduce((n, p) => n + p.length, 0), note.length)),
+      args: { committee, nominator, ticket, a: parts[0]!, b: parts[1]!, c: parts[2]!, d: parts[3]! } })),
+    (g: Group) => void g.finalize({ sender, args: { committee, nominator, ticket } }),
+  ];
   for (let i = 0; i < calls.length; i += 16) {
     const group = app.newGroup(); // Typed composer methods add to the group in place.
-    for (const { parts, note } of calls.slice(i, i + 16)) {
-      group.postChunk({ sender, note, staticFee: microAlgo(chunkFee(ARG_OVERHEAD + parts.reduce((n, p) => n + p.length, 0), note.length)),
-        args: { committee, nominator, ticket, a: parts[0]!, b: parts[1]!, c: parts[2]!, d: parts[3]! } });
-    }
+    for (const add of calls.slice(i, i + 16)) add(group);
     await group.send();
   }
-  await app.send.finalize({ sender, args: { committee, nominator, ticket } });
 }
 
 /** A seat on chain: its nominator's winning ticket. */
@@ -130,7 +150,7 @@ export class EpochReader extends ChainReader {
     await this.lastRound();
     const { boxes } = await this.algod.getApplicationBoxes(this.pins.appId).do();
     const indexes = boxes.map(b => Buffer.from(b.name)).filter(n => n.length === 9 && n[0] === 0x6d /* m */).map(n => n.readBigUInt64BE(1));
-    const all = await Promise.all(indexes.map(async i => [i, MemberFromTuple(MEMBER.decode((await this.box(Buffer.from('m'), u64(i))).value) as never)] as const));
+    const all = await mapLimited(indexes, async i => [i, MemberFromTuple(MEMBER.decode((await this.box(Buffer.from('m'), u64(i))).value) as never)] as const);
     return all.sort((a, b) => Number(a[0] - b[0])).map(([, m]) => m);
   }
 
@@ -139,13 +159,19 @@ export class EpochReader extends ChainReader {
    * a nominator copying an honest seat's keys can only spend its own nomination to cancel that seat.
    */
   async seats(committee: bigint): Promise<OrderedSeat[]> {
-    const all = await Promise.all((await this.seatIds(committee)).map(async id =>
-      ({ ...id, value: SeatFromTuple(SEAT.decode((await this.box(Buffer.from('n'), u64(committee), u64(id.nominator), u64(id.ticket))).value) as never) })));
+    const all = await mapLimited(await this.seatIds(committee), async id =>
+      ({ ...id, value: SeatFromTuple(SEAT.decode((await this.box(Buffer.from('n'), u64(committee), u64(id.nominator), u64(id.ticket))).value) as never) }));
     const keys = all.flatMap(s => [hex(s.value.sigKey), hex(s.value.epk)]);
     const unique = (k: Uint8Array) => keys.indexOf(hex(k)) === keys.lastIndexOf(hex(k));
     return all.filter(s => unique(s.value.sigKey) && unique(s.value.epk))
       .sort((a, b) => Buffer.compare(Buffer.from(a.value.sigKey), Buffer.from(b.value.sigKey)))
       .map((s, i) => ({ seat: i + 1, ...s }));
+  }
+
+  /** One seat's record. */
+  async seat(committee: bigint, id: SeatId): Promise<Seat> {
+    await this.lastRound();
+    return SeatFromTuple(SEAT.decode((await this.box(Buffer.from('n'), u64(committee), u64(id.nominator), u64(id.ticket))).value) as never);
   }
 
   async capsuleRecord(id: bigint): Promise<CapsuleRecord> {
@@ -158,7 +184,7 @@ export class EpochReader extends ChainReader {
     await this.lastRound();
     const { boxes } = await this.algod.getApplicationBoxes(this.pins.appId).do();
     const ids = boxes.map(b => Buffer.from(b.name)).filter(n => n.length === 9 && n[0] === 0x78 /* x */).map(n => n.readBigUInt64BE(1));
-    return Promise.all(ids.map(async id => ({ id, record: await this.capsuleRecord(id) })));
+    return mapLimited(ids, async id => ({ id, record: await this.capsuleRecord(id) }));
   }
 
   /** Every seat box of committee c (or of every committee), including seats dropped from the ordering: for deletion. */
