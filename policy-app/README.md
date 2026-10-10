@@ -141,7 +141,12 @@ The member worker ([`src/epoch-worker.ts`](src/epoch-worker.ts)) handles each ep
 - **Lifetime.** It builds the seats' messages, releases and claim signatures, then exits before any of them is posted. A vault whose member holds no seat exits as soon as the seats are opened.
 - **Host checks.** Vaults run with core dumps off, checked from inside, and refuse to start where swap is unencrypted (macOS) or on at all (Linux; `ECPSS_ALLOW_SWAP=1` overrides).
 - **What the worker keeps.** Only public data, its own seat numbers, and what it posts.
-- **Limits.** JavaScript can neither wipe bigints nor pin memory, so erasure is not provable: the process exit ends the secrets. A restarted member would need to replay every handover since genesis from an archival node, which is not implemented.
+- **Limits.** JavaScript can neither wipe bigints nor pin memory, so erasure is not provable: the process exit ends the secrets.
+
+**Joining after genesis (Phase 6).** A worker that starts after the genesis committee cannot replay from genesis, because old seat records are deleted. This covers a newly enrolled member and one restarted with nothing in memory.
+- **Join.** The worker takes the latest committee's public state that at least t of its seats attested; fewer than t are corrupt, so an honest seat agrees. It follows every handover from there.
+- **Lost seats.** Seats nominated to keys the member posted before a restart stay closed to it.
+- **Deposits.** It deletes the old seats it nominated in an earlier run and recovers their deposits.
 
 **Running a member.** `node dist/src/epoch-worker.js` runs one member against its own algod node. It is configured by:
 - `ALGOD_SERVER`, `ALGOD_PORT`, `ALGOD_TOKEN`;
@@ -200,6 +205,11 @@ The cryptography lives in [`crypto-spike/src/ecpss.ts`](../crypto-spike/src/ecps
 - the deposit is refunded;
 - after its last handover the expired capsule's bucket is held by nobody and re-dealt by nobody;
 - liveness: members go silent through one handover so that as few seats as possible, but at least t, speak. Every worker reports the resulting margin, the sender refuses to lock below its minimum, and the margin recovers after the next full handover.
+
+`test/epoch-join.test.ts` (1 test, Phase 6, about 25 seconds): six members run. After two handovers one crashes, losing its process, vaults and history, and a new member enrolls and starts at once. The crashed member restarts an epoch later with nothing in memory. The test shows that:
+- both join from the attested state and agree with everyone on every later handover, and no bucket is lost;
+- every seat either holds after joining speaks, and the new member nominates once its stake counts;
+- every old seat, including those the crashed run nominated, is deleted with its deposit returned.
 
 `test/epoch-stake.test.ts` (1 test, Phase 5, about 80 seconds): ten member workers, eight with bonds of 1–6 Algo, run ten committees.
 - **Seats track bonds:** each member's seat count lies within 4 standard deviations of the expectation from its tickets, and the fit's slope is between 0.8 and 1.2.

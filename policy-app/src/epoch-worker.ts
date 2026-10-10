@@ -10,7 +10,7 @@ import { decodeG2, type G2Point } from 'algorand-ephemeral-capsule-crypto-spike/
 import { SeatVault } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/vault.js';
 import { EpochCommitteeClient } from '../smart_contracts/artifacts/epoch_committee/EpochCommitteeClient.js';
 import { b64url, vrfRank, type ChainPins } from './chain.js';
-import { capsuleLabel, releaseContext } from './epoch-capsules.js';
+import { attestedState, capsuleLabel, releaseContext } from './epoch-capsules.js';
 import {
   EpochReader, bondAt, claimMessage, handoverBuckets, nominationAlpha, postMessage, seatSeedContext, ticketCount, ticketWins, windows,
   type EpochParams, type OrderedSeat, type SeatId,
@@ -42,8 +42,9 @@ interface MySeat extends SeatId { seat: number }
  * - deletes the seats it nominated once they are old, recovering their deposits.
  * Secrets live in one short-lived vault process per committee (PAPER_ALIGNMENT_PLAN.md Phase 6): the nomination key
  * for the epoch that nominates it, its seats' one-time keys and its shares. The vault exits once its seats have their
- * messages, before any is posted; this process holds only public data. A restarted member has neither its seats nor the
- * public history: it would have to replay every handover since genesis from an archival node (not implemented).
+ * messages, before any is posted; this process holds only public data.
+ * A member that starts after genesis, newly enrolled or restarted with nothing in memory, joins from the latest public
+ * state that t seats attested (see below). Seats nominated to an earlier run's keys stay closed to it.
  */
 export async function startEpochWorker(cfg: EpochWorkerConfig) {
   Config.configure({ logger: nullLogger });
@@ -236,6 +237,25 @@ export async function startEpochWorker(cfg: EpochWorkerConfig) {
       await app.send.deleteSeats({ ...cover, args: { committee: c, tickets: batch.map(s => s.ticket) } });
     }
     if (mine.length) event({ deleted: c.toString(), seats: mine.length.toString() });
+  }
+
+  // Joining after genesis: replaying from genesis is impossible once old seat records are deleted. The member takes
+  // committee c's public state as at least t of c's seats attested it when claiming (fewer than t are corrupt, so an
+  // honest seat agrees) and follows the handovers from c on. It also deletes old seats it nominated in an earlier run.
+  const startRound = await reader.lastRound(), startEpoch = startRound / E;
+  if (startEpoch > params.genesisCommittee) {
+    const latest = startRound > windows(params, startEpoch).handover[1] ? startEpoch : startEpoch - 1n;
+    let joined: bigint | undefined;
+    for (let c = latest; c > latest - KEEP && c >= params.genesisCommittee && joined === undefined; c--) {
+      const pub = await attestedState(reader, c, t);
+      if (!pub) continue;
+      views.set(c, { pub });
+      [joined, opened, processed] = [c, c - 1n, c - 1n]; // Open the seats of c + 1 next, then process c's handover.
+    }
+    check(joined !== undefined, 'No attested public state to join from: wait for a handover in which t seats agree');
+    event({ joined: joined.toString() });
+    const stale = (await reader.seatIds()).filter(s => s.nominator === myIndex && s.committee < joined - KEEP);
+    for (const c of new Set(stale.map(s => s.committee))) await deleteSeats(c).catch(report('cleanup'));
   }
 
   async function step() {

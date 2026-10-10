@@ -202,7 +202,7 @@ Proofs of knowledge for new keys are bound to the committee, bucket and dealer.
 
 **Departures:**
 - Release partials are not in the message yet; that is Phase 4.
-- An outage here means a member keeps its memory. A restarted member would have to replay every handover since genesis from an archival node, which is not implemented.
+- An outage here means a member keeps its memory. A restarted member would have to replay every handover since genesis from an archival node, which is not implemented. (Phase 6 adds joining from the attested state instead.)
 - Tests step the workers once per round; real workers poll.
 
 ## Phase 4 results (done 2026-10-09)
@@ -229,7 +229,7 @@ Capsule Lab now runs this design (see `policy-app/README.md`). A smoke test thro
 - **Client.** `policy-app/src/epoch-capsules.ts` holds the capsule label (sender, recipient and window), the attested state, and the sender and recipient sides.
 
 **Departures from the plan:**
-- **Attested state.** Senders and recipients need public commitments without replaying the whole history. Holders therefore sign a digest of the state they received when they claim, and the state itself travels in their messages. A state attested by at least t seats includes an honest seat's view, since fewer than t are corrupt. The same mechanism could let a restarted member rejoin; not built.
+- **Attested state.** Senders and recipients need public commitments without replaying the whole history. Holders therefore sign a digest of the state they received when they claim, and the state itself travels in their messages. A state attested by at least t seats includes an honest seat's view, since fewer than t are corrupt. The same mechanism lets a new or restarted member join (built in Phase 6).
 - **The label leaves out the payload hash.** The payload key is derived from the label, so including the hash would be circular. The hash is anchored on-chain separately, and AEAD authenticates the payload.
 - **Bucket lead.** A bucket's key is attested about an epoch after the bucket is created, so `bucketLead` must cover the capsule horizon plus about two epochs. With a two-epoch lead, a test capsule could never be locked.
 - **Replay protection lives off-chain.** The contract does not check the sender's proof; holders do, before releasing anything. A copied u can be registered, but it is never released.
@@ -311,6 +311,12 @@ In the first run the 6-Algo member came out 2.4 standard deviations low; the nex
 - **Senders** measure the margin from public data: the latest handover's agreeing attestations, the committee in office, and the next committee once nominated, each against t. `assertLive` refuses to lock a capsule below a chosen minimum, and Capsule Lab refuses at 0.
 - **Test.** In `test/epoch-capsules.test.ts`, members go silent through one handover so that as few seats as possible, but at least t, speak. Every worker reports the resulting margin, the sender refuses below its minimum, and the margin recovers after the next full handover.
 - **Limit.** The margin is seen after a handover. It warns senders and protects new capsules; it cannot rescue buckets already at risk.
+
+**Joining after genesis.** A worker that starts after the genesis committee could not follow the committee at all: it can only build its view by replaying from genesis, and old seat records are deleted. That broke the open membership of Phase 5 for anyone joining later, and broke every restart.
+- **Join.** The worker now takes the latest committee's public state that at least t seats attested (the Phase 4 mechanism) and follows the handovers from there.
+- **Lost seats.** Seats nominated to an earlier run's keys stay closed to it.
+- **Deposits.** It deletes the old seats it nominated in an earlier run.
+- **Test.** `test/epoch-join.test.ts`: a member crashes and restarts an epoch later, and a new member enrolls mid-run. Both join, agree with everyone on every later handover, and speak for every seat they hold. The new member nominates once its stake counts, and every old seat is deleted. It passed twice in a row.
 
 **Infrastructure.**
 - **Member CLI.** `node dist/src/epoch-worker.js` runs one member against its own algod node, configured by environment variables. It checks the host before starting. Smoke test: three CLI members, each its own process polling LocalNet, ran three handovers with margin 1 and no errors.

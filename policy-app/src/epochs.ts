@@ -161,13 +161,13 @@ export class EpochReader extends ChainReader {
     return Promise.all(ids.map(async id => ({ id, record: await this.capsuleRecord(id) })));
   }
 
-  /** Every seat box of committee c, including seats dropped from the ordering (for deletion). */
-  async seatIds(committee: bigint): Promise<SeatId[]> {
+  /** Every seat box of committee c (or of every committee), including seats dropped from the ordering: for deletion. */
+  async seatIds(committee?: bigint): Promise<(SeatId & { committee: bigint })[]> {
     await this.lastRound();
-    const prefix = Buffer.concat([Buffer.from('n'), u64(committee)]);
     const { boxes } = await this.algod.getApplicationBoxes(this.pins.appId).do();
-    return boxes.map(b => Buffer.from(b.name)).filter(n => n.length === 25 && n.subarray(0, 9).equals(prefix))
-      .map(n => ({ nominator: n.readBigUInt64BE(9), ticket: n.readBigUInt64BE(17) }));
+    return boxes.map(b => Buffer.from(b.name)).filter(n => n.length === 25 && n[0] === 0x6e /* n */)
+      .map(n => ({ committee: n.readBigUInt64BE(1), nominator: n.readBigUInt64BE(9), ticket: n.readBigUInt64BE(17) }))
+      .filter(s => committee === undefined || s.committee === committee);
   }
 
   /**
