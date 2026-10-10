@@ -113,7 +113,7 @@ export const nominationAlpha = (appId: bigint, capsuleId: bigint, slot: bigint, 
   createHash('sha256').update('capsule/nominate/v1').update(u64(appId)).update(u64(capsuleId)).update(u64(slot))
     .update(randomness).digest();
 
-/** VRF output → rank compared with the contract's nominatorThreshold; lower wins. */
+/** VRF output → rank compared with a contract's threshold (nominatorThreshold, ticketThreshold); lower wins. */
 export const vrfRank = (output: Uint8Array) => Buffer.from(output).readBigUInt64BE(0);
 
 /** HPKE info/AAD for the holder-key seed sealed to a member's nomination key. */

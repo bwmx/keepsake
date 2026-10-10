@@ -8,17 +8,19 @@ import { microAlgo } from '@algorandfoundation/algokit-utils';
 import { generateEphemeralKey, type EncryptedPayload } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/crypto.js';
 import { VerifyPool } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/parallel.js';
 import { CAPSULE_DEPOSIT, bucketKey, capsuleLabel, openCapsule, sealCapsule } from '../src/epoch-capsules.js';
-import { windows } from '../src/epochs.js';
+import { bondAt, windows } from '../src/epochs.js';
 import { algorand, deploy, lastRound, startWorkers, stepAll, type Env, type WorkerEvent, type Workers } from '../src/epoch-sim.js';
 
 /**
- * LOCALNET DEMO SERVER for the paper-aligned design (PAPER_ALIGNMENT_PLAN.md, Phase 4): evolving epoch committees hold
- * bucket keys and release capsules from their handover messages. One process plays every party with throwaway
- * accounts and serves the UI on 127.0.0.1; in a real deployment each member, sender and recipient runs its own client.
+ * LOCALNET DEMO SERVER for the paper-aligned design (PAPER_ALIGNMENT_PLAN.md, Phases 4 and 5): evolving epoch committees,
+ * drawn by stake-weighted sortition, hold bucket keys and release capsules from their handover messages. One process
+ * plays every party with throwaway accounts and serves the UI on 127.0.0.1; in a real deployment each member, sender
+ * and recipient runs its own client.
  */
 const PORT = Number(process.env.PORT ?? 8787);
 const PUBLIC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../demo/public');
 const E = 80n;
+const STAKES = [1, 2, 3, 5]; // Algos bonded by members in turn.
 
 type Account = Awaited<ReturnType<Env['fund']>>;
 interface DemoCapsule {
@@ -62,9 +64,12 @@ async function start(o: { members: number; committee: number; t: number }) {
     capsules.clear(); offline.clear(); narration.length = 0; said.clear();
     events = []; seenEvents = 0;
     settings = o;
-    say(`Deploying the EpochCommittee app and enrolling ${o.members} members (expected committee ${o.committee}, threshold ${o.t})…`);
-    const threshold = o.committee >= o.members ? 2n ** 64n - 1n : (2n ** 64n * BigInt(o.committee)) / BigInt(o.members);
-    const e = await deploy({ members: o.members, epochRounds: E, nominationRounds: 20n, handoverRounds: 45n, threshold,
+    say(`Bringing ${o.members} accounts online for consensus, waiting out the 320-round stake lookback, then deploying the EpochCommittee ` +
+      `app; each member enrolls with a bond of ${STAKES.join(', ')} Algos in turn (expected committee ${o.committee}, threshold ${o.t})…`);
+    // About one ticket per expected seat, each almost sure to win: committee sizes stay near the target on a demo-sized
+    // registry, and a member's seats follow its bond (partial tickets win in proportion).
+    const e = await deploy({ members: o.members, stakes: Array.from({ length: o.members }, (_, i) => STAKES[i % STAKES.length]!),
+      tickets: BigInt(o.committee), threshold: 2n ** 64n - 1n, epochRounds: E, nominationRounds: 20n, handoverRounds: 55n,
       shareThreshold: BigInt(o.t), bucketRounds: 2n * E, bucketLead: 6n * E });
     people = { sender: await e.fund(), recipient: await e.fund(), outsider: await e.fund() };
     pool = new VerifyPool();
@@ -81,9 +86,15 @@ async function start(o: { members: number; committee: number; t: number }) {
 }
 
 // Workers step in lockstep with the clock (an offline member is skipped and keeps its memory, like a network outage).
-async function advance(rounds = 1) {
-  for (let i = 0; i < rounds && env && workers; i++) await stepAll(env, workers, m => !offline.has(m));
-  narrate();
+// The clock and the advance button share one queue: a worker must never run two steps at once.
+let stepping = Promise.resolve();
+function advance(rounds = 1) {
+  const run = stepping.then(async () => {
+    for (let i = 0; i < rounds && env && workers; i++) await stepAll(env, workers, m => !offline.has(m));
+    narrate();
+  });
+  stepping = run.catch(() => {});
+  return run;
 }
 
 function narrate() {
@@ -98,7 +109,7 @@ function narrate() {
     if (e.posted) say(`${who} spoke once for committee ${e.posted} seat ${e.number}: re-sharings${e.releases ? `, partials for capsule ${e.releases}` : ''}. Its shares are erased.`, { private: true });
     if (e.erased) once(`e${e.erased}`, () => say(`Members are erasing their epoch-${e.erased} nomination keys.`, { private: true }));
     if (e.refused) once(`x${e.refused}`, () => say(`Holders refuse capsule ${e.refused}: its proof is bound to another policy (a copied u).`, { tone: 'warn' }));
-    if (e.deleted) once(`d${e.deleted}`, () => say(`${who} deleted committee ${e.deleted}'s records; their deposits return to the app.`));
+    if (e.deleted) say(`${who} deleted its ${e.seats} old seat${e.seats === '1' ? '' : 's'} in committee ${e.deleted} and got the deposits back.`, { private: true });
     if (e.error) say(`${who}: ${e.error} failed: ${e.message}`, { tone: 'bad' });
   }
   seenEvents = events.length;
@@ -136,7 +147,9 @@ async function state() {
     epoch: { epoch: Number(epoch), start: Number(epoch * E), nominate: w.nominate.map(Number), handover: w.handover.map(Number), end: Number((epoch + 1n) * E - 1n),
       inOffice: office.length, posted: office.filter(s => s.value.finalized).length, nominated: next.length },
     history,
-    members: env.members.map((m, i) => ({ index: i, address: m.account.toString(), online: !offline.has(i), seats: workers![i]!.view(epoch)?.holders.length ?? 0 })),
+    members: (await env.reader.members()).map((m, i) => ({ index: i, address: m.account.toString(), online: !offline.has(i),
+      bond: Number(bondAt(m, epoch)) / 1e6, seats: workers![i]!.view(epoch)?.holders.length ?? 0,
+      nominated: next.filter(s => s.nominator === BigInt(i)).length })),
     capsules: list,
     narration: narration.slice(-200),
   };
@@ -170,7 +183,8 @@ const actions: Record<string, (body: Record<string, unknown>, id?: string) => Pr
   async start(b) {
     if (starting) throw new Error('Already starting');
     const members = Math.min(Math.max(Number(b.members ?? 10), 4), 16);
-    void start({ members, committee: Math.min(Math.max(Number(b.committee ?? members), 3), members), t: Math.max(Number(b.t ?? 3), 1) });
+    // Dev-mode LocalNet takes a round per transaction: about three per seat plus each member's key post fill the handover window.
+    void start({ members, committee: Math.min(Math.max(Number(b.committee ?? members), 3), 12), t: Math.max(Number(b.t ?? 3), 1) });
     return {};
   },
   async clock(b) {

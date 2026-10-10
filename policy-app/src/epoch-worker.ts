@@ -1,4 +1,4 @@
-import { randomBytes, randomInt } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { AlgorandClient, Config, microAlgo } from '@algorandfoundation/algokit-utils';
 import { nullLogger } from '@algorandfoundation/algokit-utils/types/logging';
@@ -13,31 +13,33 @@ import { EpochCommitteeClient } from '../smart_contracts/artifacts/epoch_committ
 import { b64url, vrfRank, type ChainPins } from './chain.js';
 import { capsuleLabel, proofFromBytes, releaseContext } from './epoch-capsules.js';
 import {
-  EpochReader, claimMessage, handoverBuckets, nominationAlpha, postMessage, seatSeedContext, windows, type EpochParams, type OrderedSeat,
+  EpochReader, bondAt, claimMessage, handoverBuckets, nominationAlpha, postMessage, seatSeedContext, ticketCount, ticketWins, windows,
+  type EpochParams, type OrderedSeat, type SeatId,
 } from './epochs.js';
 
 export interface EpochWorkerConfig {
   pins: ChainPins;
   algod: { server: string; port?: number; token: string };
-  memberMnemonic: string; // Posts keys and nominations, and as a holder its one handover message per seat (speak once).
+  memberMnemonic: string; // Enrolled and bonded; posts keys and nominations, and as a holder one message per seat (speak once).
   vrfSecretKey: Uint8Array; // 64-byte VRF key (seed || public key) enrolled for this member.
   pool: VerifyPool; // Verification threads; members in one process share them.
   pollMs: number; // 0: no loop, the caller drives `step()` (lockstep tests).
   event?: (e: Record<string, string>) => void; // Operator-local log: names this member's seats, never secrets.
 }
 
-interface MySeat { seat: number; nominator: bigint; x: bigint; sign: (message: Uint8Array) => Buffer }
+interface MySeat extends SeatId { seat: number; x: bigint; sign: (message: Uint8Array) => Buffer }
 
 /**
- * A member of the EpochCommittee app (PAPER_ALIGNMENT_PLAN.md Phase 3). Each step, it:
+ * A member of the EpochCommittee app (PAPER_ALIGNMENT_PLAN.md Phases 3 and 5). Each step, it:
  * - posts its nomination keys for the current and next epoch;
- * - nominates if eligible (§3.1.2), sealing a fresh seat to a uniformly chosen member;
+ * - nominates one seat per winning sortition ticket (§3.1.2), each sealed to a member chosen at random by bond;
  * - opens its seats once nominations close, then erases that epoch's key;
  * - as a holder, builds its single handover message (§3.1.3): re-sharings, new-bucket contributions, a sealed
  *   decryption partial for each authorized capsule, and the public state it attests. It then erases its shares, claims
  *   the seat and posts from its own account. No relayer: posting reveals the holder only after it has erased.
  * - processes every handover whose window has closed, in order (catching up after an outage while the blocks and
- *   seat records last), verifying on the thread pool and combining shares for its seats in the next committee.
+ *   seat records last), verifying on the thread pool and combining shares for its seats in the next committee;
+ * - deletes the seats it nominated once they are old, recovering their deposits.
  * All secrets live only in memory. A restarted member has neither its seats nor the public history: it would have to
  * replay every handover since genesis from an archival node (not implemented).
  */
@@ -53,7 +55,8 @@ export async function startEpochWorker(cfg: EpochWorkerConfig) {
     shareThreshold: (await g.shareThreshold())!, bucketRounds: (await g.bucketRounds())!, bucketLead: (await g.bucketLead())!,
     genesisCommittee: (await g.genesisCommittee())!,
   };
-  const threshold = (await g.nominatorThreshold())!, t = Number(params.shareThreshold), E = params.epochRounds;
+  const totalTickets = (await g.totalTickets())!, ticketThreshold = (await g.ticketThreshold())!, t = Number(params.shareThreshold), E = params.epochRounds;
+  const [, seatDeposit] = await app.deposits();
   const reader = new EpochReader(algorand.client.algod, cfg.pins, params, app.appClient.getABIMethod('postChunk').getSelector());
   const event = cfg.event ?? (() => {});
   await reader.lastRound();
@@ -69,7 +72,7 @@ export async function startEpochWorker(cfg: EpochWorkerConfig) {
 
   const cover = { coverAppCallInnerTransactionFees: true, maxFee: microAlgo(20_000) } as const;
   const keys = new Map<bigint, EphemeralKeyPair | undefined>(); // Epoch → nomination key; undefined: posted by an earlier run.
-  const nominated = new Set<bigint>(); // Committees this member has decided on.
+  const winning = new Map<bigint, { ticket: bigint; proof: Uint8Array }[]>(); // Committee → winning tickets not yet nominated.
   const ordered = new Map<bigint, OrderedSeat[]>(); // Committee → its seats in key order (public).
   const seats = new Map<bigint, MySeat[]>(); // Committee → the seats this member holds in it.
   const views = new Map<bigint, { pub: Public; holders: Holder[] }>(); // Committee → state after the handover into it.
@@ -88,38 +91,49 @@ export async function startEpochWorker(cfg: EpochWorkerConfig) {
     }
   }
 
-  async function seedOf(committee: bigint) {
-    if (!(await reader.committee(committee))) { // `block` reads the seed only with a short validity window.
-      const last = await reader.lastRound();
-      await app.send.captureSeed({ args: { committee }, firstValidRound: last + 1n, validityWindow: 10 }).catch(() => {}); // Raced: fine.
-    }
-    return (await reader.committee(committee))!.seed;
-  }
-
+  // Tickets are drawn once per committee with the contract's own reading of the weight; failed nominations are retried
+  // while the window lasts.
   async function nominate(epoch: bigint) {
     const committee = epoch + 1n;
-    if (nominated.has(committee) || committee < params.genesisCommittee || enrolledRound >= epoch * E) return;
-    nominated.add(committee);
-    await nominateOnce(epoch, committee).catch(e => { nominated.delete(committee); throw e; }); // Retried while the window lasts.
+    if (committee < params.genesisCommittee || enrolledRound >= epoch * E) return;
+    if (!winning.has(committee)) {
+      const [w, total] = await app.weight({ args: { nominator: myIndex } }), seed = await reader.seed(committee), wins = [];
+      for (let j = 0n; j < ticketCount(w, total, totalTickets); j++) {
+        const { proof, output } = vrf.prove(cfg.vrfSecretKey, nominationAlpha(cfg.pins.appId, committee, j, seed));
+        if (ticketWins(vrfRank(output), j, w, total, totalTickets, ticketThreshold)) wins.push({ ticket: j, proof });
+      }
+      for (const c of winning.keys()) if (c < committee) winning.delete(c);
+      winning.set(committee, wins);
+    }
+    const wins = winning.get(committee)!;
+    if (!wins.length) return;
+    // Nominees are drawn by bond among members with a key for this epoch: a member with no bond attracts no seats.
+    const members = await reader.members(), bonds = members.map(m => bondAt(m, epoch)), sum = bonds.reduce((a, b) => a + b, 0n);
+    const draw = () => {
+      let r = BigInt(`0x${randomBytes(16).toString('hex')}`) % sum, i = 0;
+      while (r >= bonds[i]!) r -= bonds[i++]!;
+      return BigInt(i);
+    };
+    while (wins.length) {
+      let nomineeKey: Uint8Array | undefined;
+      for (let tries = 0; !nomineeKey && tries < 64; tries++) nomineeKey = await reader.nominationKey(epoch, draw());
+      if (!nomineeKey) return;
+      await nominateTicket(committee, wins[0]!, nomineeKey);
+      wins.shift();
+    }
   }
 
-  async function nominateOnce(epoch: bigint, committee: bigint) {
-    const seed = await seedOf(committee);
-    const { proof, output } = vrf.prove(cfg.vrfSecretKey, nominationAlpha(cfg.pins.appId, committee, seed));
-    if (vrfRank(output) >= threshold) return;
-    // Uniform among members with a key for this epoch, by rejection sampling.
-    let nomineeKey: Uint8Array | undefined;
-    const size = Number((await g.registrySize())!);
-    for (let tries = 0; !nomineeKey && tries < 64; tries++) nomineeKey = await reader.nominationKey(epoch, BigInt(randomInt(size)));
-    if (!nomineeKey) return;
+  async function nominateTicket(committee: bigint, win: { ticket: bigint; proof: Uint8Array }, nomineeKey: Uint8Array) {
     const seatSeed = randomBytes(32);
     try {
-      const k = seatKeys(seatSeed), sealed = await seal(b64url(nomineeKey), seatSeed, seatSeedContext(cfg.pins, committee, myIndex));
+      const k = seatKeys(seatSeed), sealed = await seal(b64url(nomineeKey), seatSeed, seatSeedContext(cfg.pins, committee, myIndex, win.ticket));
+      // `block` reads the seed only while LastValid < seed round + 1002; nominations end within 320 rounds of it.
       const last = await reader.lastRound();
-      await app.send.nominate({ ...cover, firstValidRound: last + 1n, validityWindow: 10, args: {
-        nominator: myIndex, proof, epk: k.epk.toBytes(), sigKey: k.sigKey,
-        sealedSeed: Buffer.concat([Buffer.from(sealed.enc, 'base64url'), Buffer.from(sealed.ciphertext, 'base64url')]) } });
-      event({ nominated: committee.toString() });
+      await app.send.nominate({ ...cover, firstValidRound: last + 1n, validityWindow: 100, args: {
+        nominator: myIndex, ticket: win.ticket, proof: win.proof, epk: k.epk.toBytes(), sigKey: k.sigKey,
+        sealedSeed: Buffer.concat([Buffer.from(sealed.enc, 'base64url'), Buffer.from(sealed.ciphertext, 'base64url')]),
+        payment: algorand.createTransaction.payment({ sender: member.addr, receiver: app.appAddress, amount: microAlgo(seatDeposit) }) } });
+      event({ nominated: committee.toString(), ticket: win.ticket.toString() });
     } finally {
       seatSeed.fill(0); // The nominator forgets the seat it created and whom it chose.
     }
@@ -130,12 +144,12 @@ export async function startEpochWorker(cfg: EpochWorkerConfig) {
     const committee = epoch + 1n, list = await reader.seats(committee), key = keys.get(epoch), mine: MySeat[] = [];
     for (const s of key ? list : []) {
       const seed = await open(key!.privateKey, { enc: b64url(s.value.sealedSeed.subarray(0, 32)), ciphertext: b64url(s.value.sealedSeed.subarray(32)) },
-        seatSeedContext(cfg.pins, committee, s.nominator)).catch(() => undefined);
+        seatSeedContext(cfg.pins, committee, s.nominator, s.ticket)).catch(() => undefined);
       if (!seed) continue;
       const k = seatKeys(seed);
       seed.fill(0);
       if (!k.epk.equals(decodeG2(s.value.epk)) || !Buffer.from(k.sigKey).equals(Buffer.from(s.value.sigKey))) continue; // A lying nominator.
-      mine.push({ seat: s.seat, nominator: s.nominator, x: k.x, sign: k.sign });
+      mine.push({ seat: s.seat, nominator: s.nominator, ticket: s.ticket, x: k.x, sign: k.sign });
       event({ seat: committee.toString(), number: s.seat.toString() });
     }
     ordered.set(committee, list);
@@ -172,9 +186,9 @@ export async function startEpochWorker(cfg: EpochWorkerConfig) {
         ...handover(holder, view.pub, epoch, { live: buckets.live.filter(b => view.pub.has(b)), create: buckets.create }, epks, t), releases, state,
       });
       holder.shares.clear(); // Erase before speaking; only the seat's signing key remains, to claim it.
-      await app.send.claim({ ...cover, args: { committee: epoch, nominator: m.nominator, holder: member.addr.toString(), stateDigest: digest,
-        signature: m.sign(claimMessage(cfg.pins.appId, epoch, m.nominator, member.addr.publicKey, digest)) } });
-      await postMessage(app, member.addr.toString(), epoch, m.nominator, message);
+      await app.send.claim({ ...cover, args: { committee: epoch, nominator: m.nominator, ticket: m.ticket, holder: member.addr.toString(),
+        stateDigest: digest, signature: m.sign(claimMessage(cfg.pins.appId, epoch, m.nominator, m.ticket, member.addr.publicKey, digest)) } });
+      await postMessage(app, member.addr.toString(), { committee: epoch, nominator: m.nominator, ticket: m.ticket }, message);
       event({ posted: epoch.toString(), number: m.seat.toString(), releases: [...releases.keys()].join(',') });
     }
   }
@@ -192,10 +206,10 @@ export async function startEpochWorker(cfg: EpochWorkerConfig) {
       next.map(s => decodeG2(s.value.epk)), t, (seats.get(c + 1n) ?? []).map(m => ({ seat: m.seat, x: m.x })));
     views.set(c + 1n, { pub: result.pub, holders: result.holders });
     ordered.delete(c);
-    // One member per committee, in turn, deletes the committee KEEP back: its boxes would otherwise exhaust the app's
-    // balance. Until then a member that was offline can still catch up from the on-chain digests.
+    // Each member deletes the seats it nominated KEEP committees back, recovering their deposits. Until then a member
+    // that was offline can still catch up from the on-chain digests.
     const old = c - KEEP;
-    if (old >= params.genesisCommittee && old % (await g.registrySize())! === myIndex) await deleteCommittee(old).catch(report('cleanup'));
+    if (old >= params.genesisCommittee) await deleteSeats(old).catch(report('cleanup'));
     event({ received: c.toString(), messages: raw.size.toString(), lost: result.lost.join(','),
       // Public: each bucket's key, so operators can see that all members agree and that keys never change.
       keys: [...result.pub].map(([b, poly]) => `${b}:${b64url(poly[0]!.toBytes())}`).join(',') });
@@ -204,11 +218,13 @@ export async function startEpochWorker(cfg: EpochWorkerConfig) {
   const KEEP = 3n;
   const report = (at: string) => (e: unknown) => event({ error: at, message: (e instanceof Error ? e.message : String(e)).split('\n')[0]!.slice(0, 200) });
 
-  async function deleteCommittee(c: bigint) {
-    const nominators = await reader.nominators(c);
-    for (let i = 0; i < nominators.length; i += 7) await app.send.deleteSeats({ args: { committee: c, nominators: nominators.slice(i, i + 7) } });
-    if (await reader.committee(c)) await app.send.deleteCommittee({ args: { committee: c } });
-    event({ deleted: c.toString() });
+  async function deleteSeats(c: bigint) {
+    const mine = (await reader.seatIds(c)).filter(s => s.nominator === myIndex);
+    for (let i = 0; i < mine.length; i += 7) {
+      const batch = mine.slice(i, i + 7);
+      await app.send.deleteSeats({ ...cover, args: { committee: c, tickets: batch.map(s => s.ticket) } });
+    }
+    if (mine.length) event({ deleted: c.toString(), seats: mine.length.toString() });
   }
 
   async function step() {
@@ -217,7 +233,7 @@ export async function startEpochWorker(cfg: EpochWorkerConfig) {
     if (round + 1n >= w.nominate[0] && round + 1n <= w.nominate[1]) await nominate(epoch).catch(report('nominate'));
     // Catch up in order: seats are opened before the handover into them is processed.
     while (opened + 1n < epoch || (opened + 1n === epoch && round >= w.nominate[1])) await openSeats(++opened);
-    if (round + 1n >= w.handover[0] && round + 1n <= w.handover[1]) await handOver(epoch);
+    if (round + 1n >= w.handover[0] && round + 1n <= w.handover[1]) await handOver(epoch).catch(report('handover'));
     while (windows(params, processed + 1n).handover[1] <= round && processed + 1n <= opened) await receiveHandover(++processed);
   }
 

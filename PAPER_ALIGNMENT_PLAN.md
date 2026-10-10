@@ -1,6 +1,6 @@
 # Paper alignment plan
 
-Drafted 2026-10-09; Phases 0–4 done the same day. This is a design proposal; no cryptographer has reviewed it yet, and none of it is implemented except where marked done. It aims to move the demo from one hidden committee per capsule to the paper's evolving-committee proactive secret sharing (ECPSS, [eprint 2020/464](https://eprint.iacr.org/2020/464) §3) on Algorand. The stack stays the same: Puya TS contract, TypeScript off-chain. Section numbers (§) refer to the paper.
+Drafted 2026-10-09; Phases 0–4 done the same day, Phase 5 on 2026-10-10. This is a design proposal; no cryptographer has reviewed it yet, and none of it is implemented except where marked done. It aims to move the demo from one hidden committee per capsule to the paper's evolving-committee proactive secret sharing (ECPSS, [eprint 2020/464](https://eprint.iacr.org/2020/464) §3) on Algorand. The stack stays the same: Puya TS contract, TypeScript off-chain. Section numbers (§) refer to the paper.
 
 ## Where we are
 
@@ -57,7 +57,7 @@ What changes for users: capsule secrets are no longer isolated from each other. 
 | D3 | Where handover data lives | Boxes; app-call arguments in blocks with an on-chain digest per message; off-chain storage with on-chain hashes | **App-call arguments.** This is the paper's broadcast channel (§2.1). Boxes lock 400 µAlgo of deposit per byte. Off-chain storage adds a data-availability assumption the paper doesn't make. |
 | D4 | Committee size and threshold | The paper's Chernoff bounds; exact tails | **Exact tails** (table below). Choose f and the failure probability per deployment, and derive t from the bound. |
 | D5 | Sortition seed | Today's single-operator beacon; Algorand's block seed (`block BlkSeed` of a fixed past round); a threshold VRF run by the committee | **Block seed.** It fits the paper's resettable sortition (Fig. 2): proposers can re-draw only by withholding blocks. Keep the beacon as an option and consider a committee VRF later. |
-| D6 | Membership and weighting (§1.2.2, §4) | Admin-admitted members (today); any online account, stake-weighted with `voter_params_get` and `online_stake` | **Stake-weighted and permissionless.** Members pay their own box deposits. Recovery after compromise means posting a new per-epoch key, which is already done. |
+| D6 | Membership and weighting (§1.2.2, §4) | Admin-admitted members (today); any online account, stake-weighted with `voter_params_get` and `online_stake` | **Stake-weighted and permissionless.** Members pay their own box deposits. Recovery after compromise means posting a new per-epoch key, which is already done. (Done in Phase 5 with an escrowed bond, capped by online stake: online stake alone can be counted twice. See Phase 5 results.) |
 | D7 | Release timing | Inside the handover message (speak once); at any time through the relayer | **Speak once first.** A fast path can be added later as a documented deviation. |
 
 ## Feasibility numbers
@@ -241,6 +241,56 @@ Capsule Lab now runs this design (see `policy-app/README.md`). A smoke test thro
 - **Partial latency.** Releases wait for the next handover, up to an epoch. A faster path would be a documented deviation.
 - **Legacy design still present.** `CapsulePolicy`, `src/sim.ts` and `src/worker.ts` still exist and are tested; Capsule Lab no longer uses them. Removing them is the user's call.
 
+## Phase 5 results (done 2026-10-10)
+
+**It meets the "done when" list on LocalNet.** `test/epoch-stake.test.ts` runs ten member workers through ten committees and passed three times in a row; it takes about 80 seconds. Eight members bond 1–6 Algo. Two more run workers with no weight: one is online with no bond, the other bonded with no online stake. The test shows that:
+- each member's seat count lies within 4 standard deviations of what its tickets predict, and the fit's slope is between 0.8 and 1.2;
+- both weightless members hold no ticket; their nominations are rejected and they never nominate;
+- a new bond counts from the next epoch's nominations, and a withdrawal is paid at once and stops counting at the next epoch;
+- holders with several seats speak once per seat, and no bucket is lost;
+- the app holds bonds beyond its boxes' deposits and nothing else, and the creator funded only the app account's 0.1 Algo minimum.
+
+Seats per member over ten committees (expected ± one standard deviation):
+
+| Bond (Algo) | 1 | 1 | 1 | 2 | 2 | 3 | 4 | 6 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Expected | 6.4 ± 1.9 | 6.4 ± 1.9 | 6.4 ± 1.9 | 12.8 ± 2.6 | 12.8 ± 2.6 | 19.2 ± 3.2 | 25.6 ± 3.6 | 38.4 ± 4.4 |
+| First run | 8 | 7 | 6 | 16 | 11 | 17 | 22 | 28 |
+| Second run | 7 | 6 | 8 | 17 | 10 | 24 | 23 | 35 |
+| Third run | 7 | 4 | 7 | 10 | 13 | 19 | 24 | 38 |
+
+In the first run the 6-Algo member came out 2.4 standard deviations low; the next two were on target (130 and 122 seats against 128 expected). A Monte Carlo run of the off-chain ticket functions matches the model to within 0.5%.
+
+**Design:**
+- **Weight is an escrowed bond, capped by online stake.** `voter_params_get` reads balances 320 rounds back (measured on LocalNet: a new online account counts exactly 320 rounds after its key registration). A nomination window spans many rounds, so coins moved between accounts during it would count once per account. Plan D6 used online stake directly; that is unsafe. The bond is held by the app. A bond change counts from the next epoch's nominations, after a seed nobody knew when making it. Withdrawals are paid at once: those coins still count in the current epoch, and bonded again elsewhere they count only from the next, so no coin counts twice in one sortition.
+- **Online stake still caps the weight,** so an account with no online stake cannot nominate. The nomination window must be shorter than 320 rounds, so the online stake read during it was fixed before the seed.
+- **Sortition by tickets.** The total bond is cut into `totalTickets` tickets, and a member holds ⌈w · totalTickets / total⌉ of them, the last one partial. Ticket j wins when the rank of its own VRF (over committee, ticket and seed) is below `ticketThreshold`, scaled down for a partial ticket. Each winning ticket is one seat, nominated by its own call with one VRF check, so on-chain cost is the same per seat as before.
+  - This is Algorand's binomial sortition with tickets of total / `totalTickets` stake as sub-users, which avoids computing a binomial CDF on the AVM.
+  - Expected seats are exactly proportional to weight, and splitting stake across accounts does not change them.
+  - Per member, seats are a sum of independent trials. The Phase 0 sizing models seats as Poisson, which we expect stays conservative for such sums; that is not proven here.
+- **Nominees are drawn by bond,** so accounts without one attract no seats. Under the old uniform draw, free accounts could attract most seats. The draw is off-chain and unchecked, as the uniform draw was: a corrupt nominator owns its seat anyway.
+- **Workers read their weight from the contract** through a read-only `weight` call (simulated), so they agree with it on online stake.
+- **Deposits.** Each box is paid for by whoever needs it:
+  - a member pays 139,300 µAlgo at enrollment, for its registry entry, index and three key slots;
+  - a nominator pays 137,700 µAlgo per seat and gets it back when it deletes the seat;
+  - a sender pays per capsule, as before.
+
+**Departures:**
+- **No committee box.** It had no natural payer. Nominations only ever run for the next committee, so one global-state slot holds the seed and readers take it from the block header. `captureSeed`, `deleteCommittee` and `getCommittee` are gone, and seat counts are read from seat boxes.
+- **Seats are named (committee, nominator, ticket).** The claim message (v2) and the seat-seed context bind the ticket.
+- **Nominators delete their own seats.** Refunding each nominator from a shared cleanup call needs about three references per seat, beyond the 8 references a call allows. A nominator deletes up to 7 of its own seats per call and gets one refund. Abandoned seats lock only their nominator's deposits.
+
+**Found while building:**
+- **Online stake can be counted twice** (above).
+- **Handovers overflow their window on dev-mode LocalNet** when members hold several seats. Each transaction takes a round, and each seat needs about three (claim, chunks, finalize), plus every member's key post. The stake test uses a 100-round handover window. The worker now reports a failed handover as an event instead of throwing out of its step.
+- **Capsule Lab could step a worker twice at once,** from the clock and the advance button. This produced duplicate nominations and broken handovers, and the bug predates this phase. Stepping is now queued.
+
+**Limits:**
+- **The online cap is weak.** Within a window, an adversary can move online coins between its bonded accounts, so each reaches its bond at some round. The bond is the real limit, and f is the adversary's share of bonded stake, not of Algorand's online stake.
+- **No slashing and no exit.** The bond carries no penalty, and the enrollment deposit is not refundable, because the registry is permanent.
+- **VRF work grows with stake.** A member computes one VRF per ticket per epoch, up to `totalTickets` for the whole stake.
+- **Not tried on TestNet.** Real stake distributions and how often bonds change are untested.
+
 ## Crypto sketch for D2 (review before implementing)
 
 This works in BLS12-381 with generators g1 ∈ G1 and g2 ∈ G2 and pairing e. The secret is the group element S = s·g2. The public key is P = s·g1.
@@ -317,7 +367,7 @@ Precedents: pairing-based PVSS in SCRAPE (Cascudo and David, 2017), and group-el
   - requests are refused before opening, after expiry, from the wrong wallet and for a replayed U;
   - a capsule's bucket is unrecoverable after its last handover.
 
-**Phase 5: stake-weighted, permissionless membership. Size: medium.**
+**Phase 5: stake-weighted, permissionless membership. Done 2026-10-10; see Phase 5 results.**
 - Seats are proportional to online stake (Algorand-style binomial sortition, verified on-chain). Members fund their own boxes, and the admin gate goes away.
 - Done when seat counts track stake over many epochs and accounts with no online stake can't nominate.
 
@@ -335,7 +385,7 @@ Precedents: pairing-based PVSS in SCRAPE (Cascudo and David, 2017), and group-el
 | Committee size and threshold | Phase 0 parameters; Phases 1 and 3 |
 | No verifiable re-sharing (§2.5, §2.6) | Phase 2 (done), with RIND-SO still open |
 | One committee per capsule; honest dealer per capsule | Phases 1, 2 and 4 (bucket DKG; done) |
-| Stake weighting | Phase 5 |
+| Stake weighting | Phase 5 (done) |
 | Single-operator beacon | Phase 1 (block seed; done) |
 | Best-effort erasure | Phase 6 (better, not provable) |
 | Relayer for custody traffic | Phase 3 (speak once from own account; done) |

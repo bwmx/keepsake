@@ -72,7 +72,7 @@ function renderEpoch() {
   const genesis = state.env.genesis;
   view($('eExplain')).html = e.epoch < genesis
     ? `Warming up: committee ${genesis} is the genesis committee. It holds nothing and creates the first buckets at its handover.`
-    : phase === 'nominations' ? `Each member privately runs its VRF on this epoch's block seed. Each winner seals a fresh seat's one-time keys to a randomly chosen member, then erases its choice. <b>${e.nominated}</b> seats for committee ${e.epoch + 1} so far.`
+    : phase === 'nominations' ? `Each member privately runs its VRF on this epoch's block seed, once per ticket: its bond buys tickets, so seats follow stake. For each winning ticket it seals a fresh seat's one-time keys to a member chosen at random by bond, then erases its choice. <b>${e.nominated}</b> seats for committee ${e.epoch + 1} so far.`
     : phase === 'handover' ? `Committee ${e.epoch}'s holders speak once, from their own accounts, after erasing: re-sharings of every bucket key, contributions to new buckets, capsule partials, and the public state they attest. <b>${e.posted}/${e.inOffice}</b> seats posted.`
     : `Every member checks the posted messages on its thread pool. The next committee's seats combine the first t valid dealings per bucket. The old committee's shares are gone.`;
   view($('eFacts')).html = [[e.inOffice, `seats in committee ${e.epoch}`], [e.posted, 'messages posted'], [e.nominated, `seats nominated for ${e.epoch + 1}`], [state.env.t, 'threshold t']]
@@ -130,7 +130,8 @@ function renderCapsule() {
 
 function renderMembers() {
   view($('members')).html = state.members.map(m => `<button class="member ${m.online ? '' : 'off'}" data-member="${m.index}" data-online="${m.online}"
-      title="${m.address} · click to take ${m.online ? 'offline' : 'online'}"><b>#${m.index}</b>${m.online ? 'online' : 'offline'}
+      title="${m.address} · bond ${m.bond} Algo · ${m.nominated} seat(s) nominated for the next committee · click to take ${m.online ? 'offline' : 'online'}"><b>#${m.index}</b>${m.online ? 'online' : 'offline'}
+      <div class="held">bond ${m.bond} · nominated ${m.nominated}</div>
       ${god && m.seats ? `<div class="held">${m.seats} seat${m.seats > 1 ? 's' : ''} now</div>` : ''}</button>`).join('');
 }
 

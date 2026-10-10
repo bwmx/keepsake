@@ -133,18 +133,19 @@
 <main>
   <section id="setup" class="card" hidden>
     <h3>Set up a LocalNet environment</h3>
-    <p>This deploys the EpochCommittee app, which implements the paper's evolving committees (eprint 2020/464 §3), and enrolls
-      registry members, then runs a worker for each. Every epoch, members privately win VRF sortition on the block seed and nominate
-      the next committee's anonymous seats. Then each holder of the current committee posts one handover message from its own account:
+    <p>This deploys the EpochCommittee app, which implements the paper's evolving committees (eprint 2020/464 §3). Members join
+      without permission: each account goes online for consensus and enrolls with a bond, and a worker runs for each. Every epoch,
+      members privately win stake-weighted VRF sortition on the block seed and nominate the next committee's anonymous seats. Then each holder of the current committee posts one handover message from its own account:
       re-sharings of every bucket key, contributions to new buckets, and decryption partials for capsules. Then it erases everything.
       Capsules are locked under the key of the bucket their expiry falls in. All accounts are LocalNet throwaways.</p>
     <div class="grid2">
       <div><label for="sMembers">Registry members</label><input id="sMembers" type="number" min="4" max="16" value="10"></div>
-      <div><label for="sCommittee">Expected committee size</label><input id="sCommittee" type="number" min="3" max="16" value="10"></div>
+      <div><label for="sCommittee">Expected committee size</label><input id="sCommittee" type="number" min="3" max="12" value="10"></div>
       <div><label for="sT">Threshold t</label><input id="sT" type="number" min="1" max="10" value="3"></div>
     </div>
     <p class="note">Any t seats of a committee can use a bucket key; fewer cannot. A committee also needs t honest seats online to hand over,
-      or its buckets are lost. Epochs are 80 rounds: nominations, then handover, then verification.</p>
+      or its buckets are lost. Epochs are 80 rounds: nominations, then handover, then verification. Setup waits about 320 rounds
+      first: online stake counts only after Algorand's balance lookback.</p>
     <div class="row" style="margin-top:12px"><button class="primary" id="start">Start environment</button><span id="startStatus" class="note"></span></div>
   </section>
 
@@ -206,8 +207,9 @@
       <div class="card">
         <h2>Members</h2>
         <div id="members"></div>
-        <p class="note">Click a member to take it offline or bring it back (an outage: it keeps its memory, its seats stay silent, and it
-          catches up when back). A committee hands over as long as t of its seats post.</p>
+        <p class="note">Bonds (Algo) set each member's sortition weight; a member nominates one seat per winning ticket. Click a member
+          to take it offline or bring it back (an outage: it keeps its memory, its seats stay silent, and it catches up when back). A
+          committee hands over as long as t of its seats post.</p>
       </div>
       <div class="card risk">
         <h2>Committee security</h2>

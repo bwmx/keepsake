@@ -6,7 +6,7 @@ import { VerifyPool } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/par
 import type { G2Point } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/pvss.js';
 import { startEpochWorker } from '../src/epoch-worker.js';
 import { bucketsNeeded, windows } from '../src/epochs.js';
-import { algorand, deploy, lastRound } from './epoch-env.js';
+import { algod, algorand, deploy, lastRound } from './epoch-env.js';
 
 const ALGOD = { server: 'http://localhost', port: 4001, token: 'a'.repeat(64) };
 type Event = { member: number; round: bigint } & Record<string, string | number | bigint>;
@@ -52,9 +52,12 @@ test('workers run 22 handovers on LocalNet: every bucket survives changing commi
   }
 
   assert.deepEqual(events.filter(e => e.error), [], 'workers reported errors');
-  // Old committees were deleted in turn (their boxes would exhaust the app's balance); recent ones remain for catch-up.
-  assert.equal(await env.reader.committee(G), undefined);
-  assert.ok(await env.reader.committee(last));
+  // Nominators deleted their old seats, recovering the deposits; recent ones remain for catch-up. The app holds bonds
+  // beyond its boxes' deposits and nothing else: members paid for every box.
+  assert.deepEqual(await env.reader.seatIds(G), []);
+  assert.ok((await env.reader.seatIds(last)).length > 0);
+  const account = await algod.accountInformation(env.app.appAddress).do();
+  assert.equal(account.amount - account.minBalance, (await env.app.state.global.nextBondTotal())!);
   // Every member, including the ones that were offline, processed every handover, lost nothing and agrees on the keys.
   for (let c = G; c <= last; c++) {
     const received = events.filter(e => e.received === c.toString());
@@ -103,7 +106,7 @@ test('workers run 22 handovers on LocalNet: every bucket survives changing commi
     if (method === selector('postNominationKey')) keyPosts.set(`${txn.sender}:${args[1]!.readBigUInt64BE(0)}`, txn.confirmedRound!);
     if (![selector('claim'), selector('postChunk'), selector('finalize')].includes(method!)) continue;
     assert.ok(members.has(txn.sender), 'only members speak');
-    const seat = `${args[1]!.readBigUInt64BE(0)}:${args[2]!.readBigUInt64BE(0)}`, committee = args[1]!.readBigUInt64BE(0);
+    const seat = `${args[1]!.readBigUInt64BE(0)}:${args[2]!.readBigUInt64BE(0)}:${args[3]!.readBigUInt64BE(0)}`, committee = args[1]!.readBigUInt64BE(0);
     if (method === selector('claim')) {
       assert.ok(!claims.has(seat), `seat ${seat} claimed twice`);
       claims.set(seat, { holder: txn.sender, round: txn.confirmedRound! });
