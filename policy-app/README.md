@@ -16,6 +16,7 @@ This package contains the Algorand side of [the implementation plan](../IMPLEMEN
 | `demo/` | **Capsule Lab**: a local web UI for the epoch-committee design (Phases 4–5) |
 | `smart_contracts/epoch_committee/`, `src/epochs.ts`, `src/epoch-worker.ts`, `src/epoch-capsules.ts`, `src/epoch-sim.ts` | `EpochCommittee`, its member worker, the capsule sender and recipient, and the LocalNet environment: Phases 1–5 of `../PAPER_ALIGNMENT_PLAN.md`, the paper's epoch committees, drawn by stake-weighted sortition, holding bucket keys and releasing capsules (see below) |
 | `smart_contracts/broadcast_probe/`, `bench/broadcast-probe.ts` | Phase 0 probe for `../PAPER_ALIGNMENT_PLAN.md`: argument and note limits and fees, an epoch of handover data posted and rebuilt from blocks, block-seed lookback, stake opcodes (`npm run probe`) |
+| `bench/testnet-trial.ts` | Phase 6 TestNet trial (`npm run trial`, TestNet only). It funds five throwaway members from `TESTNET_MNEMONIC` in `../.env` (git-ignored) and runs them through a public node. It runs handovers and a capsule round trip, reports timings and fees, then returns what it can to the funder. Keys of an interrupted run are kept in the git-ignored `.testnet-trial.json`; `npm run trial -- cleanup` recovers them |
 
 It runs on **LocalNet only** and is not deployed elsewhere. All cryptography stays in the [crypto spike](../crypto-spike/README.md).
 

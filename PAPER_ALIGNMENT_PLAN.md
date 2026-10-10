@@ -1,6 +1,6 @@
 # Paper alignment plan
 
-Drafted 2026-10-09; Phases 0–4 done the same day, Phase 5 and most of Phase 6 on 2026-10-10 (TestNet not started). This is a design proposal; no cryptographer has reviewed it yet, and none of it is implemented except where marked done. It aims to move the demo from one hidden committee per capsule to the paper's evolving-committee proactive secret sharing (ECPSS, [eprint 2020/464](https://eprint.iacr.org/2020/464) §3) on Algorand. The stack stays the same: Puya TS contract, TypeScript off-chain. Section numbers (§) refer to the paper.
+Drafted 2026-10-09; Phases 0–4 done the same day, Phase 5 and Phase 6 (with a small TestNet trial) on 2026-10-10. This is a design proposal; no cryptographer has reviewed it yet, and none of it is implemented except where marked done. It aims to move the demo from one hidden committee per capsule to the paper's evolving-committee proactive secret sharing (ECPSS, [eprint 2020/464](https://eprint.iacr.org/2020/464) §3) on Algorand. The stack stays the same: Puya TS contract, TypeScript off-chain. Section numbers (§) refer to the paper.
 
 ## Where we are
 
@@ -291,7 +291,7 @@ In the first run the 6-Algo member came out 2.4 standard deviations low; the nex
 - **VRF work grows with stake.** A member computes one VRF per ticket per epoch, up to `totalTickets` for the whole stake.
 - **Not tried on TestNet.** Real stake distributions and how often bonds change are untested.
 
-## Phase 6 results (erasure and liveness done 2026-10-10; TestNet not started)
+## Phase 6 results (done 2026-10-10, with a small TestNet trial)
 
 **Erasure: one short-lived process per committee's secrets.** `SeatVault` is in `crypto-spike/src/vault.ts`, and the epoch worker uses it.
 - **Contents.** A member starts a vault when it posts the nomination key for an epoch. The vault holds:
@@ -315,10 +315,17 @@ In the first run the 6-Algo member came out 2.4 standard deviations low; the nex
 **Infrastructure.**
 - **Member CLI.** `node dist/src/epoch-worker.js` runs one member against its own algod node, configured by environment variables. It checks the host before starting. Smoke test: three CLI members, each its own process polling LocalNet, ran three handovers with margin 1 and no errors.
 - **TestNet compatibility (checked 2026-10-10, read-only).** TestNet runs the same consensus version as LocalNet: specs commit `268b634`, on algod 5.0.2 against LocalNet's 5.0.1. So the extended app-call arguments and the per-byte fee measured in Phase 0 apply there too. Fees under congestion are not measured.
-- **TestNet not started.** It needs three decisions or inputs:
+- **TestNet trial (2026-10-10).** `npm run trial` (`policy-app/bench/testnet-trial.ts`) ran on TestNet through the public AlgoNode node, with app 773987601.
+  - **Setup.** Five throwaway members, each funded with 3 Algo from the funder account and online with throwaway participation keys. Bonds of 0.5 Algo and one ticket each. Epochs of 60 rounds (12 for nominations, 30 for the handover) with t = 2.
+  - **Duration.** Rounds took 2.69 s. The run lasted 32 minutes, about 15 of them waiting out the 320-round stake lookback.
+  - **Handovers.** There were five, each with all five seats posting (margin 3), and no worker errors. Holders finished posting 14–20 rounds into the 30-round window, and members finished verifying 2–6 rounds after it.
+  - **Capsule.** A capsule was locked, requested and opened, 250 s from request to plaintext. The request landed after that epoch's holders had spoken, so it waited one more handover.
+  - **Fees.** 0.56 Algo over five epochs for five seats, about 0.02 Algo per seat per epoch. Nominations cost the most (0.01 Algo each, for the VRF check's opcode budget), then claims (0.004 Algo each, for the signature check). Chunks cost 0.0014 Algo each at these small message sizes.
+  - **Cost to the funder.** 1.43 Algo net: fees, the enrollment deposits (there is no exit) and the app's own deposits. Bonds, seat and capsule deposits and account balances all came back, and the throwaway accounts were closed to the funder.
+  - **Not shown.** Committees of the planned size (130), a real stake distribution, members on their own nodes, fees under congestion, and adversarial members.
+- **Full-size TestNet deployment not started.** It needs:
   1. deployment parameters: Phase 0 suggests C = 130, t = 50, which needs a bonded population in the thousands for the anonymity assumptions;
-  2. funded TestNet accounts for the creator and members, with bonds;
-  3. one node and host per member.
+  2. one node and host per member.
 
 ## Crypto sketch for D2 (review before implementing)
 
@@ -400,7 +407,7 @@ Precedents: pairing-based PVSS in SCRAPE (Cascudo and David, 2017), and group-el
 - Seats are proportional to online stake (Algorand-style binomial sortition, verified on-chain). Members fund their own boxes, and the admin gate goes away.
 - Done when seat counts track stake over many epochs and accounts with no online stake can't nominate.
 
-**Phase 6: hardening and TestNet. Erasure and liveness done 2026-10-10; TestNet not started; see Phase 6 results.**
+**Phase 6: hardening and TestNet. Done 2026-10-10 with a small TestNet trial; full-size deployment not started; see Phase 6 results.**
 - **Erasure.** Keep key bytes in buffers we control instead of non-extractable WebCrypto keys, use one short-lived process per epoch's secrets, and disable swap and core dumps. Erasure is still not provable.
 - **Liveness.** Track the count of valid messages against t, and refuse new capsules when the margin is thin. A failed handover loses every live bucket.
 - **Infrastructure.** Give each member its own algod node, then run on TestNet with real fees and timings.
