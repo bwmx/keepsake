@@ -7,7 +7,8 @@ import { generateEphemeralKey, open, seal } from 'algorand-ephemeral-capsule-cry
 import {
   dealerGenesis, decodeMessage, encodeMessage, encodeState, handover, receive, reconstruct, seatKeys, stateDigest, type Message,
 } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/ecpss.js';
-import { decodeG2 } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/pvss.js';
+import { avmG1, avmG2, dealingsRoot, findBadDealing, merklePath, messageLeaves, type FraudProof } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/fraud.js';
+import { decodeG2, point } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/pvss.js';
 import { EpochCommitteeFactory } from '../smart_contracts/artifacts/epoch_committee/EpochCommitteeClient.js';
 import { b64url, vrfRank } from '../src/chain.js';
 import { claimMessage, nominationAlpha, postMessage, seatSeedContext, windows, type OrderedSeat } from '../src/epochs.js';
@@ -89,7 +90,7 @@ test('sortition: every VRF-eligible member nominates once; seats are ordered by 
   for (const s of await openSeats(env, committee, seats)) assert.equal(s.holder, nominees.get(b64url(s.value.sigKey)));
 });
 
-test('handover on chain: holders claim seats and post one message each; readers rebuild them from blocks; the next committee reconstructs the secret', async () => {
+test('handover on chain: holders claim seats and post one message each; readers rebuild them from blocks; the next committee reconstructs the secret; a provably bad dealing costs its holder the bond', async () => {
   const t = 3, E = 100n;
   const env = await deploy({ members: 6, epochRounds: E, nominationRounds: 25n, handoverRounds: 50n, threshold: 2n ** 64n - 1n });
   const epoch = await env.nextEpoch(), c1 = epoch + 1n, c2 = c1 + 1n;
@@ -108,25 +109,32 @@ test('handover on chain: holders claim seats and post one message each; readers 
   // Epoch c1: nominate committee c2, then committee c1 hands over to it.
   await env.nextRoundIs(c1 * E + 1n);
   for (const m of env.members) await nominate(env, m, c2, await env.reader.seed(c2));
-  const [first, cheater] = [seats1[0]!, seats1[seats1.length - 1]!];
+  const [first, liar, cheater] = [seats1[0]!, seats1[seats1.length - 2]!, seats1[seats1.length - 1]!];
   const digest = stateDigest(encodeState(state.pub)); // Holders attest the public state they received.
+  const roots = new Map<number, Buffer>(); // The dealings root each holder signs into its claim.
   const claim = (s: (typeof seats1)[number], signer = s.keys) => env.app.send.claim({ ...cover, sender: s.holder.account, args: {
-    committee: c1, nominator: s.nominator, ticket: s.ticket, holder: s.holder.account.toString(), stateDigest: digest,
-    signature: signer.sign(claimMessage(env.app.appId, c1, s.nominator, s.ticket, s.holder.account.publicKey, digest)) } });
+    committee: c1, nominator: s.nominator, ticket: s.ticket, holder: s.holder.account.toString(), stateDigest: digest, dealingsRoot: roots.get(s.seat)!,
+    signature: signer.sign(claimMessage(env.app.appId, c1, s.nominator, s.ticket, s.holder.account.publicKey, digest, roots.get(s.seat)!)) } });
+  roots.set(first.seat, Buffer.alloc(32));
   await rejects(claim(first), 'Not handing over'); // Still the nomination window.
   await env.nextRoundIs(windows(env.params, c1).nominate[1] + 1n);
   const seats2 = await openSeats(env, c2, await env.reader.seats(c2));
   const keys2 = seats2.map(s => s.keys.epk);
   const buckets = { live: [1n], create: [2n] };
 
+  // Holders build their dealings and sign their roots. Two misbehave. The cheater posts 50 KB of garbage in three
+  // chunks instead of a handover message; it cannot be proven against. The liar re-shares bucket 1 with a wrong
+  // subshare for recipient 2, under a root over what it posts, so its own claim convicts it.
+  const encoded = keys2.map(avmG2), dealings = new Map(seats1.map(s => [s.seat, handover(state.holders.find(h => h.seat === s.seat)!, state.pub, c1, buckets, keys2, t)]));
+  const lie = dealings.get(liar.seat)!.reshares.get(1n)!;
+  lie.subshares[1] = { ...lie.subshares[1]!, b: lie.subshares[1]!.b.add(point.g2(1n)) };
+  for (const s of seats1) roots.set(s.seat, s === cheater ? randomBytes(32) : dealingsRoot(dealings.get(s.seat)!, encoded));
   assert.equal((await lastRound()) + 1n, windows(env.params, c1).handover[0]);
   await rejects(claim(first, seats1[1]!.keys), 'Invalid seat signature');
   const posted = new Map<number, Buffer>();
   for (const s of seats1) {
     await claim(s);
-    const holder = state.holders.find(h => h.seat === s.seat)!;
-    // One holder misbehaves: 50 KB of garbage in three chunks instead of a handover message.
-    const message = s === cheater ? randomBytes(50_000) : encodeMessage({ ...handover(holder, state.pub, c1, buckets, keys2, t), state: encodeState(state.pub) });
+    const message = s === cheater ? randomBytes(50_000) : encodeMessage({ ...dealings.get(s.seat)!, state: encodeState(state.pub) });
     await postMessage(env.app, s.holder.account.toString(), { committee: c1, nominator: s.nominator, ticket: s.ticket }, message);
     posted.set(s.seat, message);
   }
@@ -149,15 +157,38 @@ test('handover on chain: holders claim seats and post one message each; readers 
   }
   const next = receive(messages, state.pub, c1, buckets, keys2, t, seats2.map(s => ({ seat: s.seat, x: s.keys.x })));
   assert.deepEqual(next.lost, []);
-  assert.ok(!next.used.get(1n)!.includes(cheater.seat));
+  assert.ok(!next.used.get(1n)!.includes(cheater.seat) && !next.used.get(1n)!.includes(liar.seat));
   const shares = (b: bigint) => next.holders.map(h => ({ seat: h.seat, share: h.shares.get(b)! }));
   assert.ok(reconstruct(next.pub.get(1n)!, shares(1n), t).equals(genesis.secret));
   reconstruct(next.pub.get(2n)!, shares(2n), t); // The committee-generated bucket is consistent with its commitments.
 
-  // Old seats go once the epoch is over: each nominator deletes its own and gets the deposit back.
+  // Anyone proves the liar's bad subshare on chain: its holder loses the whole bond and the reporter gets half.
+  const reporter = await env.fund(), bond = async (m: Member) => (await env.app.getMember({ args: { index: m.index } })).nextBond;
+  const accuse = (s: (typeof seats1)[number], p: FraudProof) => env.app.send.reportBadDealing({ sender: reporter, coverAppCallInnerTransactionFees: true,
+    maxFee: microAlgo(250_000), args: { committee: c1, nominator: s.nominator, ticket: s.ticket, index: BigInt(p.index), path: p.path, bucket: p.bucket,
+      kind: BigInt(p.kind), k: BigInt(p.k), epk: p.epk, commitments: p.commitments, r1: p.r1, r2: p.r2, b: p.b } });
+  const proof = findBadDealing(messages.get(liar.seat)!, keys2, t)!;
+  assert.deepEqual([proof.bucket, proof.kind, proof.k], [1n, 0, 2]);
+  // An honest leaf cannot convict, a proof under another seat's root fails, and a forged index fails.
+  const honest = messageLeaves(messages.get(first.seat)!, encoded), d0 = messages.get(first.seat)!.reshares.get(1n)!, s0 = d0.subshares[0]!;
+  const fair: FraudProof = { index: 0, path: Buffer.concat(merklePath(honest, 0)), bucket: 1n, kind: 0, k: 1, epk: encoded[0]!, // Bucket 1, recipient 1.
+    commitments: Buffer.concat(d0.commitments.map(avmG1)), r1: avmG1(s0.r1), r2: avmG2(s0.r2), b: avmG2(s0.b) };
+  await rejects(accuse(first, fair), 'Dealing is valid');
+  await rejects(accuse(first, proof), 'Not under the holder');
+  await rejects(accuse(liar, { ...proof, index: proof.index + 1 }), 'Not under the holder');
+  const before = await algod.accountInformation(reporter.addr).do(), slashed = await bond(liar.holder);
+  const { transaction } = await accuse(liar, proof);
+  const after = await algod.accountInformation(reporter.addr).do();
+  assert.equal(await bond(liar.holder), 0n);
+  assert.equal(after.amount - before.amount, slashed / 2n - transaction.fee); // Half the bond, less the report's fee.
+  console.log(`fraud proof: fee ${transaction.fee} µAlgo (t = ${t})`);
+  await rejects(accuse(liar, proof), 'Nothing to slash');
+
+  // Old seats go once the reporting window is over: each nominator deletes its own and gets the deposit back.
   const remove = (m: Member) => env.app.send.deleteSeats({ ...cover, sender: m.account, args: { committee: c1, tickets: [0n] } });
-  await rejects(remove(env.members[0]!), 'Committee still active');
   await env.nextRoundIs((c1 + 1n) * E);
+  await rejects(remove(env.members[0]!), 'Committee still active'); // Still reportable.
+  await env.nextRoundIs((c1 + 3n) * E);
   const balance = async (a: string) => (await algod.accountInformation(a).do()).amount;
   for (const m of env.members) {
     const before = await balance(m.account.toString()), { transaction } = await remove(m);

@@ -10,6 +10,18 @@ const SIG_BUDGET: uint64 = 2_500 // ed25519verify_bare costs 1,900.
 // rounds back, so the seed is still readable then (PAPER_ALIGNMENT_PLAN.md Phase 0).
 const BALANCE_LOOKBACK: uint64 = 320
 const BATCH: uint64 = 7
+// Fraud proofs (the accountability spike): a dealing can be reported until its committee is REPORT_EPOCHS epochs past;
+// seats are kept that long, and a withdrawal stays slashable for UNBONDING_EPOCHS, longer than any seat it may hold.
+const REPORT_EPOCHS: uint64 = 2
+const UNBONDING_EPOCHS: uint64 = 4
+// Two pairing checks with the G2 points first (13,000 + 10,000 per 192 bytes of G1 points: 23,000 and 33,000) and a
+// multi-scalar multiplication in G1 (6,500 + 95 per scalar), plus hashing and the budget loop itself.
+const FRAUD_BUDGET: uint64 = 70_000
+const FRAUD_BUDGET_PER_COMMITMENT: uint64 = 100
+// BLS12-381 in the encoding ec_* opcodes take (X || Y, Fp2 as c0 || c1): -g1, g2, and the scalar field's order.
+const NEG_G1 = Bytes.fromHex('17f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb114d1d6855d545a8aa7d76c8cf2e21f267816aef1db507c96655b9d5caac42364e6f38ba0ecb751bad54dcd6b939c2ca')
+const G2_GEN = Bytes.fromHex('024aa2b2f08f0a91260805272dc51051c6e47ad4fa403b02b4510b647ae3d1770bac0326a805bbefd48056c8c121bdb813e02b6052719f607dacd3a088274f65596bd0d09920b61ab5da61bbdc7f5049334cf11213945d57e5ac7d055d042b7e0ce5d527727d6e118cc9cdc6da2e351aadfd9baa8cbdd3a76d429a695160d12c923ac9cc3baca289e193548608b828010606c4a02ea734cc32acd2b02bc28b99cb3e287e85a763af267492ab572e99ab3f370d275cec1da1aaa9075ff05f79be')
+const ORDER = BigUint(0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001n)
 
 // Anyone may enroll (PAPER_ALIGNMENT_PLAN.md Phase 5). A member's sortition weight is its bond, capped by its online
 // stake. Bond changes count from the next epoch's nominations, after a seed nobody knew when making them.
@@ -20,6 +32,8 @@ export type Member = {
   bond: uint64 // Counted in nominations up to epoch bondEpoch.
   nextBond: uint64 // Counted from epoch bondEpoch + 1.
   bondEpoch: uint64
+  unbonding: uint64 // Withdrawn but still slashable: paid out from epoch unbondEpoch + UNBONDING_EPOCHS.
+  unbondEpoch: uint64
 }
 // The paper's per-epoch "long-term" key (§2.1): receives the seeds of seats nominated to this member in that epoch.
 export type EpochKey = { epoch: uint64; key: bytes<32> }
@@ -32,6 +46,7 @@ export type Seat = {
   holder: Account // Zero until claimed: the account that posts this seat's handover message.
   digest: bytes<32> // Running SHA-256 over the message chunks, rebuilt by readers from block data.
   stateDigest: bytes<32> // Signed at the claim: the committee's public state as this holder received it.
+  dealingsRoot: bytes<32> // Signed at the claim: Merkle root over the message's (dealing, recipient) leaves, for fraud proofs.
   chunks: uint64
   finalized: boolean
 }
@@ -79,6 +94,8 @@ export class EpochCommittee extends Contract {
   bondTotal = GlobalState<uint64>({ key: 'bondTotal', initialValue: 0 })
   nextBondTotal = GlobalState<uint64>({ key: 'nextBondTotal', initialValue: 0 })
   bondTotalEpoch = GlobalState<uint64>({ key: 'bondTotalEpoch', initialValue: 0 })
+  unbondingTotal = GlobalState<uint64>({ key: 'unbondingTotal', initialValue: 0 })
+  slashedTotal = GlobalState<uint64>({ key: 'slashedTotal', initialValue: 0 }) // Slashed bonds not paid out as rewards.
   // The seed of the committee being nominated (the block seed of its nomination epoch's first round).
   seedCommittee = GlobalState<uint64>({ key: 'seedCommittee', initialValue: 0 })
   seed = GlobalState<bytes<32>>({ key: 'seed' })
@@ -120,7 +137,9 @@ export class EpochCommittee extends Contract {
     assert(!entry.exists, 'Already enrolled')
     assert(payment.receiver === Global.currentApplicationAddress && payment.amount >= this.enrollMbr(), 'Payment too small')
     const index = this.registrySize.value
-    this.registry(index).value = { account: Txn.sender, vrfKey, enrolledRound: Global.round, bond: 0, nextBond: 0, bondEpoch: this.epoch() }
+    this.registry(index).value = {
+      account: Txn.sender, vrfKey, enrolledRound: Global.round, bond: 0, nextBond: 0, bondEpoch: this.epoch(), unbonding: 0, unbondEpoch: 0,
+    }
     entry.value = index + 1
     this.registrySize.value = index + 1
     this.setBond(index, payment.amount - this.enrollMbr())
@@ -134,14 +153,31 @@ export class EpochCommittee extends Contract {
   }
 
   /**
-   * Returns bond at once. It still counts in this epoch's nominations, fixed before the seed; bonded again anywhere,
-   * the coins count only from the next epoch, so no coin counts twice in one epoch's sortition.
+   * Starts withdrawing bond. It stops counting from the next epoch's nominations, so no coin counts twice in one
+   * epoch's sortition, but stays slashable for UNBONDING_EPOCHS: longer than any seat its member could hold now.
    */
   withdrawBond(amount: uint64): void {
     const index = this.indexOf(Txn.sender)
     const next = this.registry(index).value.nextBond
     assert(amount <= next, 'Bond too small')
     this.setBond(index, next - amount)
+    const m = clone(this.registry(index).value)
+    m.unbonding += amount
+    m.unbondEpoch = this.epoch()
+    this.registry(index).value = clone(m)
+    this.unbondingTotal.value += amount
+  }
+
+  /** Pays out the sender's withdrawn bond once it is no longer slashable. */
+  claimWithdrawal(): void {
+    const index = this.indexOf(Txn.sender)
+    const m = clone(this.registry(index).value)
+    assert(m.unbonding > 0, 'Nothing to claim')
+    assert(this.epoch() >= m.unbondEpoch + UNBONDING_EPOCHS, 'Still unbonding')
+    const amount = m.unbonding
+    m.unbonding = 0
+    this.registry(index).value = clone(m)
+    this.unbondingTotal.value -= amount
     itxn.payment({ receiver: Txn.sender, amount, fee: 0 }).submit()
   }
 
@@ -191,24 +227,27 @@ export class EpochCommittee extends Contract {
     assert(BigUint(op.extract(output, 0, 8)) * BigUint(total) < BigUint(this.ticketThreshold.value) * share, 'Not eligible')
     seat.value = {
       epk, sigKey, sealedSeed, holder: Global.zeroAddress, digest: Bytes<32>({ length: 32 }),
-      stateDigest: Bytes<32>({ length: 32 }), chunks: 0, finalized: false,
+      stateDigest: Bytes<32>({ length: 32 }), dealingsRoot: Bytes<32>({ length: 32 }), chunks: 0, finalized: false,
     }
   }
 
   /**
    * A holder takes its seat for the handover window of epoch `committee`: the seat's one-time key signs
-   * "ecpss/claim/v2" || appId || committee || nominator || ticket || holder || stateDigest. Only that account may then
-   * post the message. Readers trust a public state that t seats attest: fewer than t are corrupt.
+   * "ecpss/claim/v3" || appId || committee || nominator || ticket || holder || stateDigest || dealingsRoot. Only that
+   * account may then post the message, and it answers for the dealings under the root with its bond. Readers trust a
+   * public state that t seats attest: fewer than t are corrupt.
    */
-  claim(committee: uint64, nominator: uint64, ticket: uint64, holder: Account, stateDigest: bytes<32>, signature: bytes<64>): void {
+  claim(committee: uint64, nominator: uint64, ticket: uint64, holder: Account, stateDigest: bytes<32>, dealingsRoot: bytes<32>,
+    signature: bytes<64>): void {
     const seat = this.openSeat(committee, nominator, ticket)
     assert(seat.value.holder === Global.zeroAddress, 'Already claimed')
     ensureBudget(SIG_BUDGET, OpUpFeeSource.GroupCredit)
-    const message = Bytes('ecpss/claim/v2').concat(op.itob(Global.currentApplicationId.id)).concat(op.itob(committee))
-      .concat(op.itob(nominator)).concat(op.itob(ticket)).concat(holder.bytes).concat(stateDigest)
+    const message = Bytes('ecpss/claim/v3').concat(op.itob(Global.currentApplicationId.id)).concat(op.itob(committee))
+      .concat(op.itob(nominator)).concat(op.itob(ticket)).concat(holder.bytes).concat(stateDigest).concat(dealingsRoot)
     assert(op.ed25519verifyBare(message, signature, seat.value.sigKey), 'Invalid seat signature')
     seat.value.holder = holder
     seat.value.stateDigest = stateDigest
+    seat.value.dealingsRoot = dealingsRoot
   }
 
   /** Appends one chunk (four argument parts plus the note) to the seat's running digest. */
@@ -230,12 +269,12 @@ export class EpochCommittee extends Contract {
   }
 
   /**
-   * A nominator deletes its own seats once committee c's epoch is over, up to 7 per call (with its member entry, the
-   * 8 references a call allows), and gets their deposits back in one payment. Abandoned seats lock only their
-   * nominator's deposits.
+   * A nominator deletes its own seats once committee c's reporting window is over, up to 7 per call (with its member
+   * entry, the 8 references a call allows), and gets their deposits back in one payment. Abandoned seats lock only
+   * their nominator's deposits.
    */
   deleteSeats(committee: uint64, tickets: uint64[]): void {
-    assert(Global.round >= (committee + 1) * this.epochRounds.value, 'Committee still active')
+    assert(Global.round >= (committee + 1 + REPORT_EPOCHS) * this.epochRounds.value, 'Committee still active')
     assert(tickets.length <= BATCH, 'Invalid batch')
     const nominator = this.indexOf(Txn.sender)
     let refund: uint64 = 0
@@ -243,6 +282,58 @@ export class EpochCommittee extends Contract {
       if (this.seats(this.seatKey(committee, nominator, ticket)).delete()) refund += this.seatMbr()
     }
     if (refund > 0) itxn.payment({ receiver: Txn.sender, amount: refund, fee: 0 }).submit()
+  }
+
+  /**
+   * Anyone proves that a posted dealing gave recipient seat k a subshare that fails its checks against the dealing's own
+   * commitments, and the seat's holder loses its bond (half to the reporter). The leaf is
+   * sha256("ecpss/leaf/v1" || bucket || kind || k || epk || sha256(commitments) || r1 || r2 || b), and its path leads
+   * to the root the holder signed when it claimed the seat. The subshare is valid iff e(r1, g2) = e(g1, r2) and
+   * e(g1, b) = e(Σ k^l·A_l, g2)·e(r1, epk). Points use the ec_* encoding; at most 42 commitments fit one AVM value.
+   */
+  reportBadDealing(committee: uint64, nominator: uint64, ticket: uint64, index: uint64, path: bytes, bucket: uint64, kind: uint64,
+    k: uint64, epk: bytes<192>, commitments: bytes, r1: bytes<96>, r2: bytes<192>, b: bytes<192>): void {
+    const seat = clone(this.seats(this.seatKey(committee, nominator, ticket)).value)
+    assert(seat.finalized, 'Not posted')
+    assert(kind <= 1 && path.length % 32 === 0, 'Invalid proof')
+    let node = op.sha256(Bytes('ecpss/leaf/v1').concat(op.itob(bucket)).concat(op.extract(op.itob(kind), 7, 1)).concat(op.itob(k))
+      .concat(epk).concat(op.sha256(commitments)).concat(r1).concat(r2).concat(b))
+    let bits = index
+    for (let d: uint64 = 0; d < path.length; d += 32) {
+      const sibling = op.extract(path, d, 32)
+      node = bits % 2 === 0 ? op.sha256(node.concat(sibling)) : op.sha256(sibling.concat(node))
+      bits = bits / 2
+    }
+    assert(node === seat.dealingsRoot, 'Not under the holder\'s root')
+    const t = this.shareThreshold.value
+    assert(commitments.length === t * 96, 'Invalid proof')
+    ensureBudget(FRAUD_BUDGET + FRAUD_BUDGET_PER_COMMITMENT * t, OpUpFeeSource.GroupCredit)
+    // Scalars k^0..k^(t-1) mod the group order, 32 bytes each, for Σ k^l·A_l.
+    let scalars = Bytes()
+    let power: biguint = BigUint(1)
+    for (let l: uint64 = 0; l < t; l++) {
+      scalars = scalars.concat(op.bzero(32).bitwiseOr(Bytes(power)))
+      power = (power * BigUint(k)) % ORDER
+    }
+    const c = op.EllipticCurve.scalarMulMulti(op.Ec.BLS12_381g1, commitments, scalars)
+    // G2 points first: pairing checks then cost 10,000 per 192 bytes of G1 points instead of per 96 bytes of G2 points.
+    const consistent = op.EllipticCurve.pairingCheck(op.Ec.BLS12_381g2, G2_GEN.concat(r2), r1.concat(NEG_G1))
+    const matches = op.EllipticCurve.pairingCheck(op.Ec.BLS12_381g2, b.concat(G2_GEN).concat(epk), NEG_G1.concat(c).concat(r1))
+    assert(!(consistent && matches), 'Dealing is valid')
+    // Slash the holder's whole bond, including any withdrawal still unbonding.
+    const holder = this.indexOf(seat.holder)
+    const m = clone(this.registry(holder).value)
+    const penalty: uint64 = m.nextBond + m.unbonding
+    assert(penalty > 0, 'Nothing to slash')
+    this.setBond(holder, 0)
+    const after = clone(this.registry(holder).value)
+    after.bond = 0
+    after.unbonding = 0
+    this.registry(holder).value = clone(after)
+    this.unbondingTotal.value -= m.unbonding
+    const reward: uint64 = penalty / 2
+    this.slashedTotal.value += penalty - reward
+    if (reward > 0) itxn.payment({ receiver: Txn.sender, amount: reward, fee: 0 }).submit()
   }
 
   /**

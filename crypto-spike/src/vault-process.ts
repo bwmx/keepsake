@@ -3,7 +3,8 @@ import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { b64, deriveEphemeralKey, open, seal, unb64 } from './crypto.js';
 import { adopt, capsulePartial, decodeMessage, encodeMessage, encodeState, handover, seatKeys, type Holder } from './ecpss.js';
-import { decodeG1, decodeG2, decodeProof, encodePartial, seatCommitment } from './pvss.js';
+import { avmG2, dealingsRoot } from './fraud.js';
+import { decodeG1, decodeG2, decodeProof, encodePartial, point, seatCommitment } from './pvss.js';
 import type { Request, SeatInput, SpeakInput } from './vault.js';
 
 /**
@@ -26,6 +27,7 @@ function hostProblems(): string[] {
 }
 
 const audit = process.argv.includes('--audit');
+const cheat = process.argv.includes('--cheat'); // Tests only: every seat lies to recipient 1 in its first dealing.
 let ikm: Buffer | undefined; // The nomination key's seed: bytes we can wipe, not a WebCrypto key.
 const mine: { seat: number; x: bigint; sign: (message: Uint8Array) => Buffer }[] = [];
 let holders: Holder[] = [];
@@ -53,6 +55,7 @@ async function openSeats(seats: SeatInput[]) {
 /** Each held seat's single message, its claim signature, and the capsule partials it releases. */
 async function speak(o: SpeakInput) {
   const pub = new Map([...o.pub].map(([b, poly]) => [b, poly.map(decodeG1)])), next = o.next.map(decodeG2), state = encodeState(pub);
+  const encoded = next.map(avmG2);
   const posts = [];
   for (const h of holders) {
     const releases = new Map<bigint, Uint8Array>(), refused: [bigint, string][] = [];
@@ -65,9 +68,12 @@ async function speak(o: SpeakInput) {
         refused.push([c.id, e instanceof Error ? e.message : String(e)]); // E.g. a u copied under another policy.
       }
     }
-    const message = encodeMessage({ ...handover(h, pub, o.committee, { live: o.buckets.live.filter(b => pub.has(b)), create: o.buckets.create },
-      next, o.t), releases, state });
-    posts.push({ seat: h.seat, message, signature: mine.find(m => m.seat === h.seat)!.sign(o.claims.get(h.seat)!), releases: [...releases.keys()], refused });
+    const dealings = handover(h, pub, o.committee, { live: o.buckets.live.filter(b => pub.has(b)), create: o.buckets.create }, next, o.t);
+    const first = [...dealings.reshares.values(), ...dealings.contributions.values()][0];
+    if (cheat && first?.subshares[0]) first.subshares[0] = { ...first.subshares[0], b: first.subshares[0].b.add(point.g2(1n)) };
+    const message = encodeMessage({ ...dealings, releases, state }), root = dealingsRoot(dealings, encoded);
+    const signature = mine.find(m => m.seat === h.seat)!.sign(Buffer.concat([o.claims.get(h.seat)!, root])); // The holder answers for the root.
+    posts.push({ seat: h.seat, message, root, signature, releases: [...releases.keys()], refused });
   }
   return posts;
 }

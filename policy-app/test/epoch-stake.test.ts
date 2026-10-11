@@ -5,7 +5,7 @@ import { VerifyPool } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/par
 import { ticketCount, windows } from '../src/epochs.js';
 import { algod, algorand, cover, deploy, lastRound, rejects, runUntil, startWorkers, type Member, type WorkerEvent } from './epoch-env.js';
 
-test('stake-weighted sortition: seats track bonds over many epochs; no bond or no online stake, no seats; bond changes wait an epoch; members pay for every box', async () => {
+test('stake-weighted sortition: seats track bonds over many epochs; no bond or no online stake, no seats; bond changes wait an epoch; withdrawals wait out the unbonding delay; members pay for every box', async () => {
   const E = 160n, t = 3, K = 10n, tickets = 32n;
   const stakes = [1, 1, 1, 2, 2, 3, 4, 6]; // Algos bonded; each member keeps 20 more online, so its weight is its bond.
   const env = await deploy({ members: stakes.length, stakes, tickets, threshold: 2n ** 63n, epochRounds: E, nominationRounds: 40n,
@@ -16,6 +16,7 @@ test('stake-weighted sortition: seats track bonds over many epochs; no bond or n
   env.members.push(unbonded, offline);
   const G = env.params.genesisCommittee, W = algo(stakes.reduce((a, b) => a + b, 0) + 5).microAlgo;
   const pool = new VerifyPool(4), events: WorkerEvent[] = [];
+  let withdrawn = { epoch: 0n, before: 0n };
   const workers = await startWorkers(env, pool, events);
   const weight = (m: Member) => env.app.weight({ args: { nominator: m.index } });
   const attempt = (m: Member) => env.app.send.nominate({ ...cover, sender: m.account, args: { nominator: m.index, ticket: 0n,
@@ -47,14 +48,17 @@ test('stake-weighted sortition: seats track bonds over many epochs; no bond or n
     await rejects(attempt(offline), 'No such ticket');
     await runUntil(env, workers, tally);
 
-    // Bond changes count from the next epoch: a new bond starts there, and a withdrawal is paid out at once.
+    // Bond changes count from the next epoch: a new bond starts there, and a withdrawal stops counting there but is paid
+    // only once it can no longer be slashed.
     const e = (await lastRound()) / E, two = algo(2).microAlgo, five = algo(5).microAlgo;
     await env.app.send.addBond({ sender: unbonded.account, args: {
       payment: algorand.createTransaction.payment({ sender: unbonded.account, receiver: env.app.appAddress, amount: microAlgo(two) }) } });
     const balance = async (m: Member) => (await algod.accountInformation(m.account).do()).amount, before = await balance(offline);
-    const { transaction } = await env.app.send.withdrawBond({ ...cover, sender: offline.account, args: { amount: five } });
-    assert.equal((await balance(offline)) - before, five - transaction.fee);
-    await rejects(env.app.send.withdrawBond({ ...cover, sender: offline.account, args: { amount: 1n } }), 'Bond too small');
+    const { transaction } = await env.app.send.withdrawBond({ sender: offline.account, args: { amount: five } });
+    assert.equal(before - (await balance(offline)), transaction.fee); // Nothing paid yet.
+    await rejects(env.app.send.withdrawBond({ sender: offline.account, args: { amount: 1n } }), 'Bond too small');
+    await rejects(env.app.send.claimWithdrawal({ ...cover, sender: offline.account, args: [] }), 'Still unbonding');
+    withdrawn = { epoch: e, before: before - transaction.fee };
     assert.deepEqual(await weight(unbonded), [0n, W]);
     await runUntil(env, workers, async () => (await lastRound()) / E > e);
     const [w, total] = await weight(unbonded);
@@ -89,7 +93,12 @@ test('stake-weighted sortition: seats track bonds over many epochs; no bond or n
   const held = new Map<string, number>();
   for (const e of events.filter(e => e.seat)) held.set(`${e.member}:${e.seat}`, (held.get(`${e.member}:${e.seat}`) ?? 0) + 1);
   assert.ok([...held.values()].some(n => n >= 2), 'some member held several seats');
-  // The app holds bonds beyond its boxes' deposits and nothing else: members paid for every box.
-  const account = await algod.accountInformation(env.app.appAddress).do();
-  assert.equal(account.amount - account.minBalance, (await env.app.state.global.nextBondTotal())!);
+  // Four epochs after asking, the withdrawal is no longer slashable and is paid out.
+  for (const end = (withdrawn.epoch + 4n) * E; (await lastRound()) < end;) await env.tick();
+  const { transaction } = await env.app.send.claimWithdrawal({ ...cover, sender: offline.account, args: [] });
+  assert.equal((await algod.accountInformation(offline.account).do()).amount - withdrawn.before, algo(5).microAlgo - transaction.fee);
+  await rejects(env.app.send.claimWithdrawal({ ...cover, sender: offline.account, args: [] }), 'Nothing to claim');
+  // The app holds bonds and withdrawals in progress beyond its boxes' deposits, nothing else: members paid for every box.
+  const g = env.app.state.global, account = await algod.accountInformation(env.app.appAddress).do();
+  assert.equal(account.amount - account.minBalance, (await g.nextBondTotal())! + (await g.unbondingTotal())! + (await g.slashedTotal())!);
 });

@@ -74,10 +74,12 @@ async function cleanup(state: State) {
         .then(() => log(`Capsule ${state.capsule!.id} deleted; the sender's deposit is refunded.`), e => log(`Capsule cleanup: ${String(e).slice(0, 120)}`));
     }
     const seats = await seatsOf(appId);
-    const last = seats.reduce((m, s) => (s.committee > m ? s.committee : m), 0n);
-    if (last && (await lastRound()) < (last + 1n) * epochRounds) {
-      log(`Waiting for committee ${last}'s epoch to end (round ${(last + 1n) * epochRounds}) to delete its seats…`);
-      await untilRound((last + 1n) * epochRounds);
+    // Seats stay until their reporting window closes (the contract's REPORT_EPOCHS, 2); bonds stay slashable while
+    // they unbond (UNBONDING_EPOCHS, 4).
+    const last = seats.reduce((m, s) => (s.committee > m ? s.committee : m), 0n), deletable = (last + 3n) * epochRounds;
+    if (last && (await lastRound()) < deletable) {
+      log(`Waiting for committee ${last}'s reporting window to close (round ${deletable}) to delete its seats…`);
+      await untilRound(deletable);
     }
     for (const [i, member] of members.entries()) {
       const mine = seats.filter(s => s.nominator === BigInt(i));
@@ -89,8 +91,15 @@ async function cleanup(state: State) {
         }
       }
       const bond = (await app.getMember({ args: { index: BigInt(i) } }).catch(() => undefined))?.nextBond ?? 0n;
-      if (bond) await app.send.withdrawBond({ sender: member, coverAppCallInnerTransactionFees: true, maxFee: microAlgo(10_000), args: { amount: bond } })
-        .catch(e => { keep.add(i); log(`Bond withdrawal: ${String(e).slice(0, 120)}`); });
+      if (bond) await app.send.withdrawBond({ sender: member, args: { amount: bond } }).catch(e => { keep.add(i); log(`Bond withdrawal: ${String(e).slice(0, 120)}`); });
+    }
+    const unbonding = await Promise.all(members.map(async (_, i) => (await app.getMember({ args: { index: BigInt(i) } }).catch(() => undefined))));
+    const ready = unbonding.reduce((r, m) => (m && m.unbonding > 0n && (m.unbondEpoch + 4n) * epochRounds > r ? (m.unbondEpoch + 4n) * epochRounds : r), 0n);
+    if (ready > (await lastRound())) { log(`Waiting for the bonds to finish unbonding (round ${ready})…`); await untilRound(ready); }
+    for (const [i, member] of members.entries()) {
+      if (!unbonding[i]?.unbonding) continue;
+      await app.send.claimWithdrawal({ sender: member, coverAppCallInnerTransactionFees: true, maxFee: microAlgo(10_000), args: [] })
+        .catch(e => { keep.add(i); log(`Bond claim: ${String(e).slice(0, 120)}`); });
     }
     for (const s of await seatsOf(appId)) if (s.nominator < BigInt(members.length)) keep.add(Number(s.nominator));
   }

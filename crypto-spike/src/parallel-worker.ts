@@ -16,7 +16,8 @@ parentPort!.on('message', (task: Task) => {
     for (const [seat, bytes] of task.messages) {
       try { messages.set(seat, decodeMessage(bytes, seat, task.n, task.t)); } catch { /* Undecodable: absent. */ }
     }
-    const valid = validSeats(messages, pub, BigInt(task.committee), { live: [...pub.keys()], create: task.create.map(BigInt) }, next, task.t);
+    const valid = validSeats(messages, pub, BigInt(task.committee), { live: [...pub.keys()], create: task.create.map(BigInt) }, next, task.t,
+      task.roots && new Map(task.roots));
     parentPort!.postMessage({ result: [...valid].map(([b, seats]) => [b.toString(), seats]) });
   } catch (e) {
     parentPort!.postMessage({ error: e instanceof Error ? e.message : String(e) });

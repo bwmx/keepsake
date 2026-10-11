@@ -4,7 +4,8 @@ import { AlgorandClient, Config, microAlgo } from '@algorandfoundation/algokit-u
 import { nullLogger } from '@algorandfoundation/algokit-utils/types/logging';
 import vrf from '@bwmx/algorand-vrf-utils-ts';
 import { check, seal } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/crypto.js';
-import { encodeState, seatKeys, stateDigest, type Public } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/ecpss.js';
+import { decodeMessage, encodeState, seatKeys, stateDigest, type Public } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/ecpss.js';
+import { avmG2, dealingsRoot, findBadDealing } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/fraud.js';
 import { VerifyPool, receiveParallel } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/parallel.js';
 import { decodeG2, type G2Point } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/pvss.js';
 import { SeatVault, type Post } from 'algorand-ephemeral-capsule-crypto-spike/dist/src/vault.js';
@@ -25,6 +26,7 @@ export interface EpochWorkerConfig {
   pollMs: number; // 0: no loop, the caller drives `step()` (lockstep tests).
   event?: (e: Record<string, string>) => void; // Operator-local log: names this member's seats, never secrets.
   audit?: boolean; // Tests only: vaults report their shares to the operator.
+  cheat?: boolean; // Tests only: this member's seats each deal one bad subshare, provably.
 }
 
 interface MySeat extends SeatId { seat: number }
@@ -92,7 +94,7 @@ export async function startEpochWorker(cfg: EpochWorkerConfig) {
     for (const e of next ? [epoch, epoch + 1n] : [epoch]) {
       if (posted.has(e) || e < params.genesisCommittee - 1n) continue; // Earlier keys would never be opened or erased.
       if (await reader.nominationKey(e, myIndex)) { posted.add(e); continue; }
-      const vault = await SeatVault.start({ audit: cfg.audit }); // The key for epoch e opens seats of committee e + 1.
+      const vault = await SeatVault.start({ audit: cfg.audit, cheat: cfg.cheat }); // The key for epoch e opens seats of committee e + 1.
       await app.send.postNominationKey({ args: { epoch: e, key: Buffer.from(vault.publicKey, 'base64url') } }).catch(err => { vault.close(); throw err; });
       vaults.set(e + 1n, vault);
       posted.add(e);
@@ -222,7 +224,7 @@ export async function startEpochWorker(cfg: EpochWorkerConfig) {
         p.tried = true;
         if (!landed) {
           await postMessage(app, member.addr.toString(), { committee: epoch, nominator: p.nominator, ticket: p.ticket }, p.message,
-            { holder: member.addr.toString(), stateDigest: entry.digest, signature: p.signature });
+            { holder: member.addr.toString(), stateDigest: entry.digest, dealingsRoot: p.root, signature: p.signature });
         }
         event({ posted: epoch.toString(), number: p.seat.toString(), bytes: p.message.length.toString(), releases: p.releases.join(',') });
         entry.posts = entry.posts.filter(x => x !== p);
@@ -238,9 +240,11 @@ export async function startEpochWorker(cfg: EpochWorkerConfig) {
     const view = views.get(c), next = ordered.get(c + 1n);
     if (view && next) {
       // Fresh seat records: the digests and finalized flags were written after the seats were opened.
-      const raw: Map<number, Uint8Array> = await reader.messages(c, await reader.seats(c)); // Missing or mismatched: absent.
+      const posted = await reader.seats(c), raw: Map<number, Uint8Array> = await reader.messages(c, posted); // Missing or mismatched: absent.
       const buckets = handoverBuckets(params, c), held = { live: buckets.live.filter(b => view.pub.has(b)), create: buckets.create };
-      const result = await receiveParallel(cfg.pool, raw, view.pub, c, held, next.map(s => decodeG2(s.value.epk)), t);
+      const nextKeys = next.map(s => decodeG2(s.value.epk)), roots = new Map(posted.map(s => [s.seat, s.value.dealingsRoot]));
+      const result = await receiveParallel(cfg.pool, raw, view.pub, c, held, nextKeys, t, [], roots);
+      await reportBadDealings(c, posted, raw, [...held.live, ...held.create], result.valid, nextKeys).catch(report('report'));
       // The vault for committee c + 1 combines its seats' shares from the dealings everyone chose.
       const vault = vaults.get(c + 1n), chosen = new Map([...new Set([...result.used.values()].flat())].map(s => [s, raw.get(s)!]));
       const holders = await vault?.adopt(chosen, result.used, held, next.length, t).catch(e => { report('adopt')(e); closeVault(c + 1n); return undefined; });
@@ -264,6 +268,30 @@ export async function startEpochWorker(cfg: EpochWorkerConfig) {
   }
 
   const KEEP = 3n, PARALLEL = 4;
+
+  // A message that matches its signed dealings root but deals some recipient a subshare that fails its checks is proven
+  // on chain, and its holder loses its bond. Other faults (undecodable, wrong root, a wrong re-shared value or a bad
+  // contribution proof) only get the message dropped. Members race to report; the losers find nothing left to slash.
+  async function reportBadDealings(c: bigint, posted: OrderedSeat[], raw: Map<number, Uint8Array>, kept: bigint[],
+    valid: Map<bigint, number[]>, next: G2Point[]) {
+    for (const s of posted) {
+      const bytes = raw.get(s.seat);
+      if (!bytes || s.value.holder === member.addr.toString() || kept.every(b => valid.get(b)?.includes(s.seat))) continue;
+      let proof;
+      try {
+        const m = decodeMessage(bytes, s.seat, next.length, t);
+        if (!dealingsRoot(m, next.map(avmG2)).equals(Buffer.from(s.value.dealingsRoot))) continue;
+        proof = findBadDealing(m, next, t);
+      } catch {
+        continue;
+      }
+      if (!proof) continue;
+      await app.send.reportBadDealing({ coverAppCallInnerTransactionFees: true, maxFee: microAlgo(250_000), args: {
+        committee: c, nominator: s.nominator, ticket: s.ticket, index: BigInt(proof.index), path: proof.path, bucket: proof.bucket,
+        kind: BigInt(proof.kind), k: BigInt(proof.k), epk: proof.epk, commitments: proof.commitments, r1: proof.r1, r2: proof.r2, b: proof.b,
+      } }).then(() => event({ reported: c.toString(), dealer: s.seat.toString() }), e => { if (!/Nothing to slash/.test(String(e))) throw e; });
+    }
+  }
   const report = (at: string) => (e: unknown) => event({ error: at, message: (e instanceof Error ? e.message : String(e)).split('\n')[0]!.slice(0, 200) });
 
   async function deleteSeats(c: bigint) {

@@ -345,6 +345,27 @@ In the first run the 6-Algo member came out 2.4 standard deviations low; the nex
   1. deployment parameters: Phase 0 suggests C = 130, t = 50, which needs a bonded population in the thousands for the anonymity assumptions;
   2. one node and host per member.
 
+## Accountability spike results (done 2026-10-11)
+
+The first half of eprint 2026/919's route to smaller committees: holders answer with their bonds for provably bad dealings. Unreviewed, like the rest.
+- **What is provable.** A subshare that fails its own dealing's checks, e(r1, g2) = e(g1, r2) and e(g1, b) = e(Σ k^l·A_l, g2)·e(r1, epk). This is the classic way a dealer lies to one recipient.
+- **How the contract checks it without reading the message.** Each holder signs, in its claim, a Merkle root over one leaf per (dealing, recipient). A leaf holds the bucket, kind, recipient seat k and its key, the hash of the dealing's commitments, and the subshare, all in the encoding `ec_*` opcodes take. `reportBadDealing` checks the leaf's path to the root, computes Σ k^l·A_l with `ec_multi_scalar_mul`, and runs two `ec_pairing_check`s. The leaf carries the recipient's key and k, so the contract never needs the next committee's seat order.
+- **Why honest holders are safe.** Every honest leaf passes both checks, and a path needs the holder's own root. Verifiers drop any message whose dealings do not match its signed root, which counts as silence, so a lying root cannot frame anyone either.
+- **Penalty.** The holder's whole bond, including withdrawals still unbonding, half to the reporter. Withdrawals now wait four epochs, and seats cannot be deleted for two epochs after their committee, so evidence and bond both outlast the reporting window.
+- **Cost.** About 0.11 Algo per report at t = 3 (105 budget top-ups). Putting G2 points first in `ec_pairing_check` matters: costs are 10,000 per 192 bytes of the second group's points, so G1 there is four times cheaper than G2. At most 42 commitments fit one AVM value, so production t (50–79) needs the multi-scalar multiplication split.
+- **Tests.**
+  - `test/epochs.test.ts` convicts a liar by hand: half the bond goes to the reporter. Reports against an honest leaf, under another root, with a forged index, or twice all fail.
+  - `test/epoch-slash.test.ts` runs a cheating member, from a test-only vault mode, among seven honest workers. They report it and it is slashed; nothing is lost; afterwards it wins no tickets and holds no seats. The test passed many times in a row once the setup had eight members. With six, a lone cheater holding four of the six seats left fewer than t valid dealings, as the threshold model predicts.
+- **Found.**
+  - **Self-reporting.** A cheater can report itself and recover half its bond, so the effective penalty is half. The worker never reports its own seats, but a cheater can use another account.
+  - **Small bonds.** Bonds under about 0.25 Algo do not pay a reporter back for the fee.
+- **Not covered.**
+  - silence (2026/919 uses time-lock puzzles);
+  - a wrong re-shared value: A_0 must equal the dealer's seat commitment, which needs the attested public state on chain;
+  - bad contribution proofs;
+  - garbled messages;
+  - fixed-size committees.
+
 ## Crypto sketch for D2 (review before implementing)
 
 This works in BLS12-381 with generators g1 ∈ G1 and g2 ∈ G2 and pairing e. The secret is the group element S = s·g2. The public key is P = s·g1.
@@ -459,7 +480,7 @@ Precedents: pairing-based PVSS in SCRAPE (Cascudo and David, 2017), and group-el
     - sortition with a fixed, not just expected, committee size;
     - a tighter corruption analysis.
 
-    That is a different model from ours, based on accountability. Phase 5's bonds could carry the penalties: a seat's holder is known once it claims, and an invalid dealing is publicly checkable. A silent seat cannot be attributed without something like time-lock puzzles. Fixed-size sortition would also remove the committee-size variance our tails pay for. **Worth a design spike; not started.**
+    That is a different model from ours, based on accountability. Phase 5's bonds could carry the penalties: a seat's holder is known once it claims, and an invalid dealing is publicly checkable. A silent seat cannot be attributed without something like time-lock puzzles. Fixed-size sortition would also remove the committee-size variance our tails pay for. **Penalties for provably bad dealings are done (Accountability spike results); fixed-size sortition and time-lock puzzles for silence are not.**
   - **[eprint 2026/1101](https://eprint.iacr.org/2026/1101)**, "Tail-Hammer" (David, Lavagnino, Pagnin, Stankovski Wagner). Exact parameters for VRF-selected anonymous committees, about 25% smaller than Blum et al.'s (CCS '23) estimates. It takes the same approach as our exact-tail calculator (`npm run params`), so it does not shrink our numbers further. Its finite-population binomial treatment could replace our N ≫ C Poisson limit, which is conservative.
 
 ## Kept and removed

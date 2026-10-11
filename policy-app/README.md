@@ -28,7 +28,7 @@ Requires Node.js 24+, AlgoKit CLI 2.10+, Docker, Git and npm. The VRF library (`
 (cd crypto-spike && npm ci --ignore-scripts)
 cd policy-app && npm exec --yes --package=pnpm@12.6.0 -- npm ci
 algokit localnet start
-npm test        # 7 LocalNet tests, about 6 minutes
+npm test        # 8 LocalNet tests, about 9 minutes
 npm run demo    # Capsule Lab at http://127.0.0.1:8787
 npm run browser-check   # Capsule Lab in headless Chrome (needs Chrome installed)
 ```
@@ -58,17 +58,19 @@ LocalNet must be in its default dev mode, where a block is sealed per transactio
 `EpochCommittee` implements the paper's evolving committees (eprint 2020/464 §3), and capsules are released from its handover messages (Phase 4). Epoch e spans rounds `[e·E, (e+1)·E)`. Committee c is nominated in epoch c − 1 from the block seed of that epoch's first round, and hands over in epoch c.
 
 **Membership and sortition (Phase 5).** Anyone may join; there is no admin. A member enrolls with a payment that covers its own boxes, and the rest of the payment is its bond.
-- **Weight.** A member's sortition weight is its bond, capped by its online stake (`voter_params_get`, which reads balances 320 rounds back). A bond change counts from the next epoch's nominations, after a seed nobody knew when making it. The bond is escrowed because online stake alone can be counted twice: moving coins between accounts during a nomination window counts them once per account. A withdrawal is paid at once; the coins still count in the current epoch's nominations, and bonded again elsewhere they count only from the next.
+- **Weight.** A member's sortition weight is its bond, capped by its online stake (`voter_params_get`, which reads balances 320 rounds back). A bond change counts from the next epoch's nominations, after a seed nobody knew when making it. The bond is escrowed because online stake alone can be counted twice: moving coins between accounts during a nomination window counts them once per account. A withdrawal stops counting from the next epoch, so no coin counts twice in one sortition. It is paid only after four epochs (`claimWithdrawal`), so it stays slashable for longer than any seat its member holds.
 - **Tickets.** The total bond is cut into `totalTickets` tickets, so a member holds ⌈w · totalTickets / total⌉ of them, the last one partial. Ticket j wins when the rank of `VRF(sha256("ecpss/nominate/v2" ‖ appId ‖ committee ‖ j ‖ seed))` is below `ticketThreshold`, scaled down for a partial ticket. This is Algorand's binomial sortition with tickets as sub-users. Each winning ticket is one seat, so a committee has about `totalTickets · ticketThreshold / 2^64` seats. Splitting stake across accounts does not change a member's expected seats.
 - **Nominees.** A nominator seals each seat to a member drawn at random by bond, so accounts without a bond attract no seats.
-- **Deposits.** Everyone pays for the boxes they need: a member for its registry entry and three key slots (139,300 µAlgo), a nominator for each seat (137,700 µAlgo, refunded when it deletes the seat), and a sender for each capsule. The creator funds only the app account's 0.1 Algo minimum. The app holds bonds and box deposits, nothing else.
+- **Deposits.** Everyone pays for the boxes they need: a member for its registry entry and three key slots (145,700 µAlgo), a nominator for each seat (150,500 µAlgo, refunded when it deletes the seat), and a sender for each capsule. The creator funds only the app account's 0.1 Algo minimum. The app holds box deposits, bonds, withdrawals still unbonding and slashed funds, nothing else.
+- **Penalties.** A holder answers with its bond for every dealing under the root it signs. Anyone who proves a bad subshare on chain (`reportBadDealing`) gets half the holder's bond, including any withdrawal still unbonding. The other half stays in the app (`slashedTotal`).
 
 | Rounds of epoch e | Call | Who | Checks |
 | --- | --- | --- | --- |
-| Any | `enroll(vrfKey, pay)` once; `addBond(pay)`; `withdrawBond(amount)`; `postNominationKey(epoch, key)` for the current or next epoch, never replaced | Anyone; member | `Txn.sender`; the enrollment payment covers the deposits |
+| Any | `enroll(vrfKey, pay)` once; `addBond(pay)`; `withdrawBond(amount)`, then `claimWithdrawal()` four epochs later; `postNominationKey(epoch, key)` for the current or next epoch, never replaced | Anyone; member | `Txn.sender`; the enrollment payment covers the deposits |
 | 1…`nominationRounds` (under 320) | `nominate(index, ticket, proof, epk, sigKey, sealedSeed, pay)`, once per winning ticket, for committee e + 1 | Member with weight | Exact seat deposit. The first nomination copies the seed with `block BlkSeed`, so nominations use a validity window ending within about 1,000 rounds of the seed round. The ticket exists for the member's weight, `vrf_verify` with the enrolled key, the rank wins, and the member enrolled before the seed round |
-| Next `handoverRounds` | `claim(e, nominator, ticket, holder, stateDigest, sig)`, then `postChunk(e, nominator, ticket, a, b, c, d)` with the note, then `finalize` | Committee e's holders | The seat's one-time Ed25519 key signs the claim; after that, `Txn.sender` must be the claimed holder. Each chunk is folded into the seat's on-chain running digest |
-| After epoch e | `deleteSeats(e, tickets[])` (batches of 7) | The nominator (workers do it three committees back) | Refunds the seat deposits to the nominator |
+| Next `handoverRounds` | `claim(e, nominator, ticket, holder, stateDigest, dealingsRoot, sig)`, then `postChunk(e, nominator, ticket, a, b, c, d)` with the note, then `finalize`, as one atomic group per seat | Committee e's holders | The seat's one-time Ed25519 key signs the claim, including the Merkle root of the message's (dealing, recipient) leaves. After that, `Txn.sender` must be the claimed holder. Each chunk is folded into the seat's on-chain running digest |
+| Until epoch e + 2 ends | `reportBadDealing(e, nominator, ticket, index, path, bucket, kind, k, epk, commitments, r1, r2, b)` | Anyone | The leaf hashes to the seat's signed root along the path. The subshare then fails e(r1, g2) = e(g1, r2) or e(g1, b) = e(Σ k^l·A_l, g2)·e(r1, epk), checked with `ec_multi_scalar_mul` and two `ec_pairing_check`s. The holder's bond is slashed, half to the reporter. About 0.11 Algo in fees, mostly for opcode budget; t ≤ 42 |
+| After epoch e + 2 | `deleteSeats(e, tickets[])` (batches of 7) | The nominator (workers do it three committees back) | Refunds the seat deposits to the nominator |
 | Any (from committee genesis + 1) | `registerCapsule(recipient, openRound, expiresRound, u, proof, payloadHash, pay)` under bucket `expiresRound / bucketRounds`, which must exist by schedule; the window must span ≥ 2 epochs | Sender | Exact payment of the 118,500 µAlgo box deposit |
 | `[openRound, expiresRound)` | `requestAccess(capsule, requestId, recipientKey)` once | Recipient | `Txn.sender` |
 | After `expiresRound` | `deleteCapsule(capsule)` refunds the deposit | Anyone | — |
@@ -83,6 +85,7 @@ The member worker ([`src/epoch-worker.ts`](src/epoch-worker.ts)) handles each ep
 - **Nomination.** It reads its weight as the contract does, draws a VRF for each of its tickets, and nominates one seat per winning ticket. Each seat is sealed to a member drawn by bond.
 - **Seats.** It opens its seats when nominations close, then erases that epoch's key.
 - **Handover.** As a holder, it builds its single handover message and its secrets are erased. Then it posts each seat from its own account as one atomic group: claim, message chunks and finalize. That is one round per seat for messages up to 14 chunks (about 280 KB). Seats go four at a time. There is no relayer.
+- **Reports.** When a message matches its signed root but deals some recipient a bad subshare, the member proves it on chain (`fraud.ts` in the crypto spike builds the proof). Members race to report, and the losers find nothing left to slash. A member never reports its own seats.
 - **Retries.** A stage counts as done only once it succeeds. A node error, such as a public node's rate limit, means it is retried at the next step, never skipped. The reader fetches at most eight boxes at a time.
 - **Processing.** It processes every closed handover in order and catches up after an outage. Messages are verified on a shared thread pool (`VerifyPool` from the crypto spike), and it combines shares for its seats in the next committee.
 - **Cleanup.** It deletes the seats it nominated three committees back and recovers their deposits.
@@ -154,16 +157,22 @@ The cryptography lives in [`crypto-spike/src/ecpss.ts`](../crypto-spike/src/ecps
 - every seat either holds after joining speaks, and the new member nominates once its stake counts;
 - every old seat, including those the crashed run nominated, is deleted with its deposit returned.
 
-`test/epoch-stake.test.ts` (1 test, Phase 5, about 80 seconds): ten member workers, eight with bonds of 1–6 Algo, run ten committees.
+`test/epoch-slash.test.ts` (1 test, about 20 seconds): eight members, one of which deals recipient 1 a bad subshare in every seat's first dealing under the root it signs (a test-only vault mode). The test shows that:
+- honest members report it and the cheater loses its bond while the others keep theirs;
+- no bucket is lost and all members agree;
+- once slashed, the cheater wins no tickets and holds no new seats;
+- the app holds exactly its deposits, bonds, withdrawals in progress and slashed funds.
+
+`test/epoch-stake.test.ts` (1 test, Phase 5, about 90 seconds): ten member workers, eight with bonds of 1–6 Algo, run ten committees.
 - **Seats track bonds:** each member's seat count lies within 4 standard deviations of the expectation from its tickets, and the fit's slope is between 0.8 and 1.2.
 - **No weight, no seats:** an online member with no bond and a bonded member with no online stake hold no ticket. Their nominations are rejected, and they never nominate.
-- **Bond timing:** a new bond counts from the next epoch's nominations. A withdrawal is paid at once and stops counting at the next epoch.
+- **Bond timing:** a new bond counts from the next epoch's nominations. A withdrawal stops counting at the next epoch and is paid only after four, and claiming it early is refused.
 - **Several seats per member:** holders with several seats speak once per seat, and no bucket is lost.
 - **Deposits:** the app holds bonds beyond its boxes' deposits and nothing else.
 
 `test/epochs.test.ts` (3 tests, Phases 1–2; equal bonds, one ticket each):
 - **Sortition:** the captured seed equals the block's seed. Exactly the VRF-eligible members nominate, once each. Ineligible, late-enrolled, copied-proof, duplicate, nonexistent-ticket, underpaid and out-of-window nominations are rejected. Seats are numbered in signing-key order and each opens only for its nominee.
-- **Handover on chain:** two real committees. The first holds an honest dealer's bucket. Each holder claims its seat with its one-time key and posts one encoded handover message (re-share plus a new committee-generated bucket); one holder posts 50 KB of garbage instead. Readers rebuild every message from blocks, the next committee drops the cheater and reconstructs the original secret, and after the epoch each nominator deletes its seat and gets the deposit back. Early, forged, repeated or outsider claims and posts are rejected.
+- **Handover on chain:** two real committees. A liar re-shares with a bad subshare under the root it signs: a report convicts it (half its bond to the reporter), while a report against an honest leaf, under another seat's root or with a forged index fails, and a second report finds nothing to slash. The first holds an honest dealer's bucket. Each holder claims its seat with its one-time key and posts one encoded handover message (re-share plus a new committee-generated bucket); one holder posts 50 KB of garbage instead. Readers rebuild every message from blocks, the next committee drops the cheater and reconstructs the original secret, and after the epoch each nominator deletes its seat and gets the deposit back. Early, forged, repeated or outsider claims and posts are rejected.
 - **Creation and immutability:** epoch-length and nomination-window checks; no update, delete or opt-in.
 
 ## What is and isn't protected
@@ -175,6 +184,7 @@ The cryptography lives in [`crypto-spike/src/ecpss.ts`](../crypto-spike/src/ecps
 - **Committees here are small.** Security needs fewer than t corrupt seats per epoch, and liveness needs t honest seats speaking. The plan's sizes (C ≈ 130–210) come from exact tails at f = 5%. Demo and test committees of 5–20 seats tolerate little corruption.
 - **A seat is corrupt if its nominator or its holder is,** about 2f. Nominators are public and know a seat's keys until they erase them.
 - **Weight is bonded stake.** f is the adversary's share of the bonds, not of Algorand's online stake. The online-stake cap can be worked around by moving online coins between bonded accounts.
+- **Penalties cover one fault.** Only a subshare that fails its pairing checks is provable and slashed. Silence, a garbled message, a root that does not match the message, a wrong re-shared value (A_0 is not the dealer's seat commitment) and a bad contribution proof only get the message dropped. A cheater can report itself and recover half its bond, so the effective penalty is half. A report costs about 0.11 Algo, so it does not pay against bonds under about 0.25 Algo.
 - **Forward secrecy rests on erasure.** Sealed seeds and handover messages stay on-chain forever. Each committee's secrets live in a vault process that exits before its seats speak, but JavaScript cannot wipe bigints or pin memory, so erasure is not provable. Until a vault exits, stealing a member's live state exposes what that vault holds.
 - **One failed handover loses every live bucket.** That happens when fewer than t honest seats speak. Senders can check the liveness margin before locking, but nothing can rescue a bucket once a handover fails.
 - **Network traffic can identify holders.** Members should each use their own node; a shared node sees which account reads what. Each worker trusts its own algod node, since this is not a light client.

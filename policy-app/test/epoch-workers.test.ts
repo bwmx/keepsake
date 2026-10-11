@@ -56,8 +56,8 @@ test('workers run 22 handovers on LocalNet: every bucket survives changing commi
   // beyond its boxes' deposits and nothing else: members paid for every box.
   assert.deepEqual(await env.reader.seatIds(G), []);
   assert.ok((await env.reader.seatIds(last)).length > 0);
-  const account = await algod.accountInformation(env.app.appAddress).do();
-  assert.equal(account.amount - account.minBalance, (await env.app.state.global.nextBondTotal())!);
+  const g = env.app.state.global, account = await algod.accountInformation(env.app.appAddress).do();
+  assert.equal(account.amount - account.minBalance, (await g.nextBondTotal())! + (await g.unbondingTotal())! + (await g.slashedTotal())!);
   // Every member, including the ones that were offline, processed every handover, lost nothing and agrees on the keys.
   for (let c = G; c <= last; c++) {
     const received = events.filter(e => e.received === c.toString());

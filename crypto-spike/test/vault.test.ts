@@ -46,7 +46,7 @@ test('seat vaults: each opens only its seats and wipes its key, combines shares,
 
     const keys = (seats: Seat[]) => seats.map(s => s.epk);
     const checkClaims = (posts: Post[], seats: Seat[], committee: bigint) => posts.forEach(p =>
-      assert.ok(verify(null, claims([p.seat], committee).get(p.seat)!, ed25519(seats.find(s => s.seat === p.seat)!.sigKey), p.signature)));
+      assert.ok(verify(null, Buffer.concat([claims([p.seat], committee).get(p.seat)!, p.root]), ed25519(seats.find(s => s.seat === p.seat)!.sigKey), p.signature)));
 
     // Committee 1 (genesis) creates bucket 7. Each vault exits once it has spoken.
     await A.genesis(); await B.genesis();

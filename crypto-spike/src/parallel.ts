@@ -11,6 +11,7 @@ import type { G2Point } from './pvss.js';
 export interface Task {
   n: number; t: number; committee: string; epks: Uint8Array[];
   live: [string, Uint8Array[]][]; create: string[]; messages: [number, Uint8Array][];
+  roots?: [number, Uint8Array][]; // Each seat's signed dealings root (fraud.ts); a message that does not match is dropped.
 }
 export type TaskResult = [string, number[]][];
 
@@ -66,7 +67,7 @@ export class VerifyPool {
  * every valid dealer per bucket (the handover's liveness margin is how far each list exceeds t).
  */
 export async function receiveParallel(pool: VerifyPool, raw: Map<number, Uint8Array>, pub: Public, committee: bigint, buckets: Buckets,
-  next: G2Point[], t: number, mine: { seat: number; x: bigint }[] = []) {
+  next: G2Point[], t: number, mine: { seat: number; x: bigint }[] = [], roots?: Map<number, Uint8Array>) {
   const seats = [...raw.keys()].sort((a, b) => a - b);
   // One task per thread: every batch repeats about C pairings, so fewer, larger batches are cheaper (measured).
   const per = Math.max(1, Math.ceil(seats.length / pool.size)), k = Math.ceil(seats.length / per);
@@ -74,7 +75,8 @@ export async function receiveParallel(pool: VerifyPool, raw: Map<number, Uint8Ar
     live: buckets.live.filter(b => pub.has(b)).map(b => [b.toString(), pub.get(b)!.map(p => p.toBytes())] as [string, Uint8Array[]]),
     create: buckets.create.map(String) };
   const results = await Promise.all(Array.from({ length: k }, (_, i) =>
-    pool.run({ ...common, messages: seats.slice(i * per, (i + 1) * per).map(s => [s, raw.get(s)!]) })));
+    pool.run({ ...common, messages: seats.slice(i * per, (i + 1) * per).map(s => [s, raw.get(s)!]),
+      ...(roots ? { roots: seats.slice(i * per, (i + 1) * per).filter(s => roots.has(s)).map(s => [s, roots.get(s)!]) } : {}) })));
   const valid = new Map<bigint, number[]>();
   for (const [b, list] of results.flat()) valid.set(BigInt(b), [...(valid.get(BigInt(b)) ?? []), ...list].sort((x, y) => x - y));
   const chosen = new Set([...valid.values()].flatMap(list => list.slice(0, t)));

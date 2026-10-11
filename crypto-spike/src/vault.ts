@@ -20,10 +20,13 @@ export interface CapsuleInput {
 }
 export interface SpeakInput {
   committee: bigint; pub: Map<bigint, Uint8Array[]>; buckets: Buckets; next: Uint8Array[]; t: number;
-  claims: Map<number, Uint8Array>; // per seat, the claim message its one-time key signs
+  claims: Map<number, Uint8Array>; // per seat, the claim message its one-time key signs, less its last field: the dealings root
   capsules: CapsuleInput[];
 }
-export interface Post { seat: number; message: Uint8Array; signature: Uint8Array; releases: bigint[]; refused: [bigint, string][] }
+export interface Post {
+  seat: number; message: Uint8Array; root: Uint8Array; signature: Uint8Array; // root: the message's dealings root (fraud.ts), signed into the claim
+  releases: bigint[]; refused: [bigint, string][];
+}
 export type Request =
   | { op: 'open'; seats: SeatInput[] }
   | { op: 'genesis' }
@@ -50,10 +53,14 @@ export class SeatVault {
     });
   }
 
-  /** Starts a vault with a fresh nomination key (an X25519 public key, base64url). `audit` (tests only) reveals shares. */
-  static start(o: { audit?: boolean } = {}): Promise<SeatVault> {
+  /**
+   * Starts a vault with a fresh nomination key (an X25519 public key, base64url). Tests only: `audit` reveals shares,
+   * and `cheat` makes every seat deal recipient 1 a bad subshare in its first dealing, under a root that convicts it.
+   */
+  static start(o: { audit?: boolean; cheat?: boolean } = {}): Promise<SeatVault> {
     const script = fileURLToPath(new URL('./vault-process.js', import.meta.url));
-    const child = spawn('/bin/sh', ['-c', 'ulimit -c 0 && exec "$0" "$@"', process.execPath, script, ...(o.audit ? ['--audit'] : [])],
+    const child = spawn('/bin/sh', ['-c', 'ulimit -c 0 && exec "$0" "$@"', process.execPath, script, ...(o.audit ? ['--audit'] : []),
+      ...(o.cheat ? ['--cheat'] : [])],
       { stdio: ['ignore', 'inherit', 'inherit', 'ipc'], serialization: 'advanced' });
     return new Promise((resolve, reject) => {
       child.once('message', (m: { publicKey?: string; error?: string }) => (m.publicKey ? resolve(new SeatVault(child, m.publicKey)) : reject(new Error(m.error))));

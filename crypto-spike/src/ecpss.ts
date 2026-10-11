@@ -1,6 +1,7 @@
 import { createHash, createPrivateKey, createPublicKey, hkdfSync, sign, type KeyObject } from 'node:crypto';
 import { bls12_381 as bls } from '@noble/curves/bls12-381.js';
 import { check } from './crypto.js';
+import { avmG2, dealingsRoot } from './fraud.js';
 import {
   ORDER, aggregate, combine, combinePartials, deal, dealingSize, decodeDealing, decodeG1, encapsulate, encodeDealing, lagrange,
   partial, point, randomScalar, seatCommitment, validDealings, verifyG1, verifyPartial,
@@ -87,7 +88,12 @@ const dealingsFor = (messages: Map<number, Message>, b: bigint, kind: 'reshares'
  * seat order. Re-sharings are checked against the committee's commitments, new-key contributions against their proofs.
  * Dealings are independent, so callers may check disjoint groups of seats in parallel and merge.
  */
-export function validSeats(messages: Map<number, Message>, pub: Public, committee: bigint, buckets: Buckets, next: G2Point[], t: number) {
+export function validSeats(messages: Map<number, Message>, pub: Public, committee: bigint, buckets: Buckets, next: G2Point[], t: number,
+  roots?: Map<number, Uint8Array>) {
+  if (roots) { // A message whose dealings do not hash to the root its holder signed counts as absent (fraud.ts).
+    const encoded = next.map(avmG2);
+    messages = new Map([...messages].filter(([s, m]) => roots.has(s) && dealingsRoot(m, encoded).equals(Buffer.from(roots.get(s)!))));
+  }
   const valid = new Map<bigint, number[]>();
   for (const b of buckets.live) {
     const poly = pub.get(b), dealings = dealingsFor(messages, b, 'reshares');

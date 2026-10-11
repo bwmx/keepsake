@@ -79,11 +79,13 @@ export const seatSeedContext = (pins: ChainPins, committee: bigint, nominator: b
 ]);
 
 /**
- * What a seat's one-time key signs to claim it for `holder` (a 32-byte account public key), attesting the committee's
- * public state it received (ecpss `stateDigest`); must match `claim`.
+ * What a seat's one-time key signs to claim it for `holder` (a 32-byte account public key): the committee's public
+ * state it received (ecpss `stateDigest`) and its message's dealings root (fraud.ts), which it answers for with its
+ * bond; must match `claim`. Without the root, the prefix a vault signs once it has built the dealings.
  */
-export const claimMessage = (appId: bigint, committee: bigint, nominator: bigint, ticket: bigint, holder: Uint8Array, stateDigest: Uint8Array) =>
-  Buffer.concat([Buffer.from('ecpss/claim/v2'), u64(appId), u64(committee), u64(nominator), u64(ticket), holder, stateDigest]);
+export const claimMessage = (appId: bigint, committee: bigint, nominator: bigint, ticket: bigint, holder: Uint8Array, stateDigest: Uint8Array,
+  dealingsRoot: Uint8Array = new Uint8Array()) =>
+  Buffer.concat([Buffer.from('ecpss/claim/v3'), u64(appId), u64(committee), u64(nominator), u64(ticket), holder, stateDigest, dealingsRoot]);
 
 // A chunk is four argument parts and the note. Arguments total 16,384 bytes: selector 4 + three uint64 24 + four
 // 2-byte length prefixes 8 leave 16,348 bytes of data; the note holds 4,096.
@@ -108,7 +110,7 @@ const chunks = (message: Uint8Array) => Array.from({ length: Math.max(1, Math.ce
  * chunks (about 280 KB) takes a single group: one round and one confirmation per seat.
  */
 export async function postMessage(app: EpochCommitteeClient, sender: string, seat: SeatId & { committee: bigint }, message: Uint8Array,
-  claim?: { holder: string; stateDigest: Uint8Array; signature: Uint8Array }) {
+  claim?: { holder: string; stateDigest: Uint8Array; dealingsRoot: Uint8Array; signature: Uint8Array }) {
   const { committee, nominator, ticket } = seat;
   type Group = ReturnType<EpochCommitteeClient['newGroup']>;
   // The claim's signature check needs SIG_BUDGET; a group pools 700 opcodes per app call, and each budget top-up the
