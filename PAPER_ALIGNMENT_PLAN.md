@@ -1,4 +1,4 @@
-# Paper alignment plan
+# Keepsake: paper alignment plan
 
 Drafted 2026-10-09; Phases 0–4 done the same day, Phase 5 and Phase 6 (with a small TestNet trial) on 2026-10-10. This is a design proposal; no cryptographer has reviewed it yet, and none of it is implemented except where marked done. It aims to move the demo from one hidden committee per capsule to the paper's evolving-committee proactive secret sharing (ECPSS, [eprint 2020/464](https://eprint.iacr.org/2020/464) §3) on Algorand. The stack stays the same: Puya TS contract, TypeScript off-chain. Section numbers (§) refer to the paper.
 
@@ -93,9 +93,9 @@ The paper's 5% parameters cost too much per epoch on a shared chain. The analysi
 - Production-grade: 2^-64 gives **C = 210, t = 79**.
 - LocalNet/CI: small overrides that test mechanics only.
 
-`npm run params` in `crypto-spike/` prints the full table. Its test checks the paper's table to within 2%.
+`npm run params` in `crypto/` prints the full table. Its test checks the paper's table to within 2%.
 
-**Prototype.** `crypto-spike/src/pvss.ts` (unreviewed) implements the sketch. Its tests confirm the algebra:
+**Prototype.** `crypto/src/pvss.ts` (unreviewed) implements the sketch. Its tests confirm the algebra:
 - a committee-generated key survives two handovers;
 - a tampered subshare, a wrong commitment, a missing proof of knowledge or a duplicate dealer drops only that dealing;
 - shares from different epochs don't combine;
@@ -110,7 +110,7 @@ The paper's 5% parameters cost too much per epoch on a shared chain. The analysi
 | 120 | 44 | 0.84 s | 15.8 s | 59.2 s | 0.48 s | 0.02 s | 0.02 s | 0.14 s | 30.2 KB | 3.54 MiB |
 | 200 | 72 | 1.3 s | 39.6 s | 142.5 s | 0.97 s | 0.02 s | 0.02 s | 0.25 s | 50.3 KB | 9.81 MiB |
 
-**Chain** (`npm run probe` in `policy-app/`, LocalNet):
+**Chain** (`npm run probe` in `chain/`, LocalNet):
 - **Limits and fees.** One call carries up to 16,384 bytes of arguments and a 4,096-byte note; one byte more is rejected. The minimum fee covers 2,048 bytes of arguments and a 1,024-byte note. Beyond that, the idle network charged about 0.1 µAlgo per extra byte.
 - **Posting an epoch.** C = 120 took 240 calls in 15 groups; C = 200 took 600 calls in 38 groups. Dev mode seals a block per group, so this does not test real block capacity.
 - **Reading it back.** A reader rebuilt every seat's running digest from raw blocks through algod: 120/120 and 200/200 match the chain, read in 0.1–0.2 s.
@@ -134,7 +134,7 @@ The paper's 5% parameters cost too much per epoch on a shared chain. The analysi
 
 **Both phases meet their "done when" lists**, on LocalNet and in-process. Everything is still unreviewed. Workers don't run epochs yet (Phase 3), and capsules don't use bucket keys yet (Phase 4).
 
-**Phase 1** adds the `EpochCommittee` app (`policy-app/smart_contracts/epoch_committee/`) and `policy-app/src/epochs.ts`. Three LocalNet tests cover it:
+**Phase 1** adds the `EpochCommittee` app (`chain/smart_contracts/epoch_committee/`) and `chain/src/epochs.ts`. Three LocalNet tests cover it:
 - **Sortition.** The committee is exactly the VRF-eligible members (binomial around N·p). Each eligible member nominates once. Ineligible, late-enrolled, copied-proof, duplicate and out-of-window nominations are rejected.
 - **Seats.** Seats are numbered in signing-key order, and each opens only for its nominee.
 - **Seed.** The captured seed equals the block's seed.
@@ -153,7 +153,7 @@ Phase 1 departs from the plan in four ways:
 - **Windows.** Nominations for the next committee take rounds 1…nominationRounds of each epoch. The current committee's handover takes the following handoverRounds rounds, all inside the epoch. Nominators seal seeds to the nominee's key for the nomination epoch.
 - **Funding.** The admin still pre-funds every box (a seat box is 121,700 µAlgo). That changes with Phase 5.
 
-**Phase 2** adds `crypto-spike/src/ecpss.ts` on top of `pvss.ts`, with 4 tests (35 in crypto-spike). They show:
+**Phase 2** adds `crypto/src/ecpss.ts` on top of `pvss.ts`, with 4 tests (35 in crypto). They show:
 - every live bucket survives 10 handovers through committees of 5–8 seats, each with up to t − 1 random cheaters (silent, lying to a seat, re-sharing another value, or forging a contribution proof);
 - committee-generated keys never change their public key, and shares from different committees don't combine;
 - an expired bucket is never re-dealt, so neither the chain nor the next committee ever holds it again;
@@ -168,9 +168,9 @@ Proofs of knowledge for new keys are bound to the committee, bucket and dealer.
 ## Phase 3 results (done 2026-10-09)
 
 **It meets the "done when" list on LocalNet.** The pieces are:
-- `policy-app/src/epoch-worker.ts`;
+- `chain/src/epoch-worker.ts`;
 - schedule parameters added to `EpochCommittee`: the threshold t, the bucket width and lead, and the genesis committee;
-- `crypto-spike/src/parallel.ts`.
+- `crypto/src/parallel.ts`.
 
 `test/epoch-workers.test.ts` drives 10 member workers in lockstep through 22 handovers, with four outages of one or two members for one or two epochs each. It has passed twice in a row and takes about 3 minutes. It shows that:
 - every member, including the ones that were offline, processes every handover;
@@ -214,7 +214,7 @@ Proofs of knowledge for new keys are bound to the committee, bucket and dealer.
 - the sender's deposit is refunded after expiry;
 - after its last handover the expired capsule's bucket is held by nobody and re-dealt by nobody.
 
-Capsule Lab now runs this design (see `policy-app/README.md`). A smoke test through its API (lock, wrong wallet, request, open, replay) ran cleanly.
+Capsule Lab now runs this design (see `chain/README.md`). A smoke test through its API (lock, wrong wallet, request, open, replay) ran cleanly.
 
 **What was added:**
 - **Contract.** `EpochCommittee` gains:
@@ -225,8 +225,8 @@ Capsule Lab now runs this design (see `policy-app/README.md`). A smoke test thro
 - **Message sections.** A holder's handover message gains two sections:
   - **releases:** per capsule, a partial sealed to the recipient's key, with a proof against its seat commitment;
   - **state:** the holder's view of the committee's public commitments.
-- **Library.** `crypto-spike/src/ecpss.ts` adds the state encoding, its digest, and an entry walker that reads these sections without decoding any dealing. `pvss.ts` adds the partial wire format, checked strictly, including membership of the order-r subgroup.
-- **Client.** `policy-app/src/epoch-capsules.ts` holds the capsule label (sender, recipient and window), the attested state, and the sender and recipient sides.
+- **Library.** `crypto/src/ecpss.ts` adds the state encoding, its digest, and an entry walker that reads these sections without decoding any dealing. `pvss.ts` adds the partial wire format, checked strictly, including membership of the order-r subgroup.
+- **Client.** `chain/src/epoch-capsules.ts` holds the capsule label (sender, recipient and window), the attested state, and the sender and recipient sides.
 
 **Departures from the plan:**
 - **Attested state.** Senders and recipients need public commitments without replaying the whole history. Holders therefore sign a digest of the state they received when they claim, and the state itself travels in their messages. A state attested by at least t seats includes an honest seat's view, since fewer than t are corrupt. The same mechanism lets a new or restarted member join (built in Phase 6).
@@ -293,7 +293,7 @@ In the first run the 6-Algo member came out 2.4 standard deviations low; the nex
 
 ## Phase 6 results (done 2026-10-10, with a small TestNet trial)
 
-**Erasure: one short-lived process per committee's secrets.** `SeatVault` is in `crypto-spike/src/vault.ts`, and the epoch worker uses it.
+**Erasure: one short-lived process per committee's secrets.** `SeatVault` is in `crypto/src/vault.ts`, and the epoch worker uses it.
 - **Contents.** A member starts a vault when it posts the nomination key for an epoch. The vault holds:
   - that key, as a random 32-byte seed in a buffer we wipe; the X25519 key is derived from it only to open seats;
   - the seats' one-time keys;
@@ -321,7 +321,7 @@ In the first run the 6-Algo member came out 2.4 standard deviations low; the nex
 **Infrastructure.**
 - **Member CLI.** `node dist/src/epoch-worker.js` runs one member against its own algod node, configured by environment variables. It checks the host before starting. Smoke test: three CLI members, each its own process polling LocalNet, ran three handovers with margin 1 and no errors.
 - **TestNet compatibility (checked 2026-10-10, read-only).** TestNet runs the same consensus version as LocalNet: specs commit `268b634`, on algod 5.0.2 against LocalNet's 5.0.1. So the extended app-call arguments and the per-byte fee measured in Phase 0 apply there too. Fees under congestion are not measured.
-- **TestNet trial (2026-10-10).** `npm run trial` (`policy-app/bench/testnet-trial.ts`) ran on TestNet through the public AlgoNode node, with app 773987601.
+- **TestNet trial (2026-10-10).** `npm run trial` (`chain/bench/testnet-trial.ts`) ran on TestNet through the public AlgoNode node, with app 773987601.
   - **Setup.** Five throwaway members, each funded with 3 Algo from the funder account and online with throwaway participation keys. Bonds of 0.5 Algo and one ticket each. Epochs of 60 rounds (12 for nominations, 30 for the handover) with t = 2.
   - **Duration.** Rounds took 2.69 s. The run lasted 32 minutes, about 15 of them waiting out the 320-round stake lookback.
   - **Handovers.** There were five, each with all five seats posting (margin 3), and no worker errors. Holders finished posting 14–20 rounds into the 30-round window, and members finished verifying 2–6 rounds after it.
@@ -409,7 +409,7 @@ Precedents: pairing-based PVSS in SCRAPE (Cascudo and David, 2017), and group-el
   - old epochs' records can be deleted.
 
 **Phase 2: ECPSS library, off-chain. Done 2026-10-09; see Phase 1 and 2 results.**
-- In `crypto-spike/`, add:
+- In `crypto/`, add:
   - §3.1 sharing, with mock committee selection;
   - handover with pairing-checked dealings, and reconstruction;
   - bucket DKG;
@@ -499,6 +499,6 @@ Precedents: pairing-based PVSS in SCRAPE (Cascudo and David, 2017), and group-el
 - the relayer for custody traffic;
 - the dependence on a single-operator beacon.
 
-`algorand-hidden-v1`, the per-capsule design with its beacon and relayer, was removed from `policy-app` on 2026-10-10. The crypto spike's milestone-1 protocol keeps the mode for its own tests.
+`algorand-hidden-v1`, the per-capsule design with its beacon and relayer, was removed from `chain` on 2026-10-10. The crypto package's milestone-1 protocol keeps the mode for its own tests.
 
 **Out of scope:** the paper's Appendix A variant (0.38 resilience against a slow adversary, with proofs linear in N) and the paper's MPC/obfuscation applications.

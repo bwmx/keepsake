@@ -1,6 +1,8 @@
-# Ephemeral secret capsules on Algorand
+# Keepsake: original implementation plan
 
-> **Status (2026-10-10).** This is the original plan. Its on-chain "Hidden committee design" (beacon-seeded per-capsule committees, a relayer) was built for milestones 2–3. It was then superseded by [PAPER_ALIGNMENT_PLAN.md](PAPER_ALIGNMENT_PLAN.md), the paper's evolving epoch committees, and removed from `policy-app`; it remains in Git history. The goals, stack choice and threat discussion below still apply.
+> **Milestone 4 (2026-10-12).** Wallet integration and in-browser decryption are done: Capsule Lab's senders and recipients use a wallet (LocalNet KMD or the Lute extension) and seal, request and decrypt in the page.
+>
+> **Status (2026-10-10).** This is the original plan. Its on-chain "Hidden committee design" (beacon-seeded per-capsule committees, a relayer) was built for milestones 2–3. It was then superseded by [PAPER_ALIGNMENT_PLAN.md](PAPER_ALIGNMENT_PLAN.md), the paper's evolving epoch committees, and removed from `chain`; it remains in Git history. The goals, stack choice and threat discussion below still apply.
 
 ## Purpose and agreed stack
 
@@ -8,7 +10,7 @@ Build a demonstrable, short-lived secret custody system inspired by [Can a Publi
 
 **User-selected stack: AlgoKit + Algorand TypeScript compiled with Puya TS.** Do not replace this with Algorand Python, PyTeal, or TEALScript. Use ordinary TypeScript/Node.js for off-chain cryptography and custodian services. Algorand TypeScript is an AVM-targeting subset and cannot run the off-chain crypto libraries.
 
-Current scope: implement the first crypto spike. **Milestone 1 is implemented and verified: strict TypeScript compilation, 26 passing tests, and a passing CLI demo (2026-10-06).** See `crypto-spike/README.md` and `crypto-spike/PROTOCOL.md`. **Milestones 2 and 3 are implemented on LocalNet only in `policy-app/`, with hidden, variable-size holder committees (paper-aligned VRF steps 1–5; 8 passing LocalNet tests, 2026-10-06), plus a local demo UI for milestone 4 (Capsule Lab); see `policy-app/README.md`.** TestNet/MainNet deployment, wallet integration, distributed services, and UI are later milestones. This document is a handoff reference; it does not authorize another agent to publish or deploy to MainNet.
+Current scope: implement the first crypto package. **Milestone 1 is implemented and verified: strict TypeScript compilation, 26 passing tests, and a passing CLI demo (2026-10-06).** See `crypto/README.md` and `crypto/PROTOCOL.md`. **Milestones 2 and 3 are implemented on LocalNet only in `chain/`, with hidden, variable-size holder committees (paper-aligned VRF steps 1–5; 8 passing LocalNet tests, 2026-10-06), plus a local demo UI for milestone 4 (Capsule Lab); see `chain/README.md`.** TestNet/MainNet deployment, wallet integration, distributed services, and UI are later milestones. This document is a handoff reference; it does not authorize another agent to publish or deploy to MainNet.
 
 ## Product behavior
 
@@ -55,9 +57,9 @@ Bind every cryptographic message to a versioned domain, network, application, ca
 
 ## Milestones
 
-### 1. Standalone TypeScript crypto spike — current deliverable
+### 1. Standalone TypeScript crypto package — current deliverable
 
-Location: `crypto-spike/` beside this document.
+Location: `crypto/` beside this document.
 
 - AES-256-GCM payload encryption with random 256-bit keys and 96-bit nonces.
 - 3-of-5 Shamir using `shamir-secret-sharing`; no handwritten finite-field arithmetic.
@@ -72,7 +74,7 @@ Acceptance: every three-of-five subset recovers the message; fewer shares are re
 
 ### 2. Algorand application with AlgoKit / Puya TS
 
-**Status: implemented and tested on LocalNet** in `policy-app/` (algorand-typescript/puya-ts 1.3.1). It has been revised twice. First the sender stopped naming custodians, in favour of a public beacon draw. Then that draw was replaced by hidden committees; see the hidden committee design below. The app has an admin-gated, append-only registry where members enroll their own VRF keys and post a fresh nomination key every epoch. `register` commits the terms and the registry snapshot and requests beacon randomness atomically, with an exact payment. Members nominate one-time holder keys with VRF proofs checked on-chain. The sender anchors the manifest hash, commitments and deposits once. Custody acknowledgments are authenticated by one-time-key signatures, not `Txn.sender`, and activate the capsule after all five. One recipient request binds `requestId` and the X25519 key inside `[openRound, expiresRound)`. Cleanup and withheld-proof cancellation refund the sender. There is no update, delete or opt-in path. The contract cannot recompute the manifest hash, so custodians compare manifest fields with the on-chain record before acknowledging.
+**Status: implemented and tested on LocalNet** in `chain/` (algorand-typescript/puya-ts 1.3.1). It has been revised twice. First the sender stopped naming custodians, in favour of a public beacon draw. Then that draw was replaced by hidden committees; see the hidden committee design below. The app has an admin-gated, append-only registry where members enroll their own VRF keys and post a fresh nomination key every epoch. `register` commits the terms and the registry snapshot and requests beacon randomness atomically, with an exact payment. Members nominate one-time holder keys with VRF proofs checked on-chain. The sender anchors the manifest hash, commitments and deposits once. Custody acknowledgments are authenticated by one-time-key signatures, not `Txn.sender`, and activate the capsule after all five. One recipient request binds `requestId` and the X25519 key inside `[openRound, expiresRound)`. Cleanup and withheld-proof cancellation refund the sender. There is no update, delete or opt-in path. The contract cannot recompute the manifest hash, so custodians compare manifest fields with the on-chain record before acknowledging.
 
 - Scaffold the official Algorand TypeScript project with AlgoKit and pin compiler/toolchain dependencies.
 - Start on LocalNet. Use the current stable `@algorandfoundation/algorand-typescript` and `@algorandfoundation/puya-ts` compatibility pair; verify actual versions before installing.
@@ -85,7 +87,7 @@ Acceptance: every three-of-five subset recovers the message; fewer shares are re
 
 ### 3. Custodian services and chain adapter
 
-**Status: implemented and tested on LocalNet** in `policy-app/src/`:
+**Status: implemented and tested on LocalNet** in `chain/src/`:
 - `ChainReader` pins genesis hash and app ID and fails closed on a wrong network, an unsynced or stale node, or missing state.
 - Every release re-reads chain authorization, including after the HPKE await.
 - Holder keys are authenticated by the nominator's VRF proof plus its `Txn.sender`. Holders are reached only through the chain: deposits, acknowledgments and releases are on-chain, and the manifest is rebuilt from chain data and hash-checked.
@@ -108,7 +110,7 @@ Remaining:
 
 ### 4. UI and LocalNet demonstration
 
-**Status: partly done (2026-10-06).** `policy-app/demo` (Capsule Lab, `npm run demo`) shows:
+**Status: partly done (2026-10-06).** `chain/demo` (Capsule Lab, `npm run demo`) shows:
 - private release;
 - premature, wrong-wallet, replay and expired refusals;
 - members taken offline;
@@ -143,7 +145,7 @@ Add proactive share refresh only with a reviewed protocol and implementation. Re
 - **Operator:** a single operator (us) holds the VRF key.
 - **Proofs:** the AVM `vrf_verify` (draft-03) checks proofs of each target round's block seed.
 - **Delivery:** the beacon delivers per-request randomness to our app's `fulfillRandomness` callback. Its daemon proves and relays.
-- **Implementation:** in `policy-app/`; see its README for the trust analysis.
+- **Implementation:** in `chain/`; see its README for the trust analysis.
 
 This is useful for committee selection, not for keeping a key secret. Never derive capsule encryption keys or shares from public VRF outputs.
 
@@ -178,7 +180,7 @@ Before implementing VRF selection (how each item was resolved is noted in parent
 6. Budget the documented `vrf_verify` cost (5700 opcode units, subject to current protocol verification) using the appropriate AlgoKit/AVM budgeting mechanism; measure actual grouped transaction costs.
 7. Reassess committee compromise probability. A 3-of-5 demo does not inherit the paper's large-population resilience bounds.
 
-Recommended sequence: complete the fixed-committee crypto spike, integrate Algorand policy, then add verified VRF-based **public** committee selection if the available facility is a beacon. Reserve private nominating committees and anonymous holding committees for the research track. **Status: public beacon selection was built first, then superseded by hidden committees (`algorand-hidden-v1`).**
+Recommended sequence: complete the fixed-committee crypto package, integrate Algorand policy, then add verified VRF-based **public** committee selection if the available facility is a beacon. Reserve private nominating committees and anonymous holding committees for the research track. **Status: public beacon selection was built first, then superseded by hidden committees (`algorand-hidden-v1`).**
 
 References: [paper §2.3](https://eprint.iacr.org/2020/464.pdf), [Algorand randomness](https://dev.algorand.co/concepts/protocol/randomness/), [AVM vrf_verify](https://dev.algorand.co/reference/algorand-teal/opcodes/), [draft/RFC compatibility](https://staging.dev.algorand.co/concepts/smart-contracts/cryptographic-tools/).
 
@@ -215,7 +217,7 @@ Not implemented:
 
 ## Handoff instructions
 
-Read this file and `crypto-spike/README.md` before continuing. Run `npm ci`, `npm test`, and `npm run demo` inside `crypto-spike/`. Preserve the crypto/chain boundary and all security limitations. Do not infer successful Algorand integration from an in-memory authorization test. Record actual completed work and verification in the README; distinguish a tested demo from audited production security.
+Read this file and `crypto/README.md` before continuing. Run `npm ci`, `npm test`, and `npm run demo` inside `crypto/`. Preserve the crypto/chain boundary and all security limitations. Do not infer successful Algorand integration from an in-memory authorization test. Record actual completed work and verification in the README; distinguish a tested demo from audited production security.
 
 ## References
 

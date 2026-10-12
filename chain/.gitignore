@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.env
+*.log
+smart_contracts/artifacts/
+browser-shots/
+demo/public/client.js
