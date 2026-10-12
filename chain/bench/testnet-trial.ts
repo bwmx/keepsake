@@ -12,7 +12,7 @@ import { startEpochWorker } from '../src/epoch-worker.js';
 import { EpochReader, windows, type EpochParams } from '../src/epochs.js';
 
 /**
- * TESTNET TRIAL (PAPER_ALIGNMENT_PLAN.md Phase 6). Runs the epoch design on TestNet through a shared public algod node:
+ * TESTNET TRIAL (docs/results.md). Runs the epoch design on TestNet through a shared public algod node:
  * funds throwaway member accounts from TESTNET_MNEMONIC, brings them online with dummy participation keys, deploys
  * EpochCommittee, enrolls them with small bonds, runs their workers in this process, locks and opens a capsule, and
  * reports round times, handover timings and fees. Then it returns what it can to the funder. Enrollment deposits stay

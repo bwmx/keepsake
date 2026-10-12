@@ -5,7 +5,7 @@ import type { Message } from './ecpss.js';
 import { batchOk, seatCommitment, type Dealing, type Form, type G1Point, type G2Point, type Subshare } from './pvss.js';
 
 /**
- * UNREVIEWED. Fraud proofs for bad dealings (PAPER_ALIGNMENT_PLAN.md, the accountability spike after eprint 2026/919).
+ * UNREVIEWED. Fraud proofs for bad dealings (docs/design.md, Accountability; after eprint 2026/919).
  * A holder commits, when it claims its seat, to a Merkle root over one leaf per dealing and recipient: the recipient's
  * key, the commitment its subshare should open to (E = Σ_i w_i(k)·C_i, from the dealing's commitments) and the
  * encrypted subshare. A leaf whose subshare fails its two pairing checks against E is provable on chain with the leaf

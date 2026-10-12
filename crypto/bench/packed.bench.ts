@@ -6,7 +6,7 @@ import {
 } from '../src/ecpss.js';
 import { deal, dealingSize, point, validDealings, type Dealing } from '../src/pvss.js';
 
-// Packed epochs (PAPER_ALIGNMENT_PLAN.md): one member's handover and everyone's verification for one epoch, plain
+// Packed epochs (docs/design.md): one member's handover and everyone's verification for one epoch, plain
 // (one dealing per bucket) against a pack and an unpack, single-threaded. L live buckets and one created per epoch.
 const C = Number(process.env.C ?? 64), t = Number(process.env.T ?? 16), L = 4;
 const time = <T>(f: () => T): [T, number] => { const s = performance.now(); return [f(), performance.now() - s]; };

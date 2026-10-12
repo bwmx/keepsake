@@ -8,7 +8,7 @@ import {
 import { encodeMessage } from '../src/ecpss.js';
 import { VerifyPool, receiveParallel } from '../src/parallel.js';
 
-// Phase 0: one member's work per epoch for the pairing re-sharing prototype, single-threaded.
+// One member's work per epoch for the pairing re-sharing prototype, single-threaded.
 const time = <T>(f: () => T): [T, number] => { const s = performance.now(); return [f(), performance.now() - s]; };
 const fr = bls.fields.Fr;
 

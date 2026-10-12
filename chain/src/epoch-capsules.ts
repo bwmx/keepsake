@@ -7,7 +7,7 @@ import { b64url, hex, type ChainPins } from './chain.js';
 import { handoverBuckets, windows, type CapsuleRecord, type EpochParams, type EpochReader, type OrderedSeat } from './epochs.js';
 
 /**
- * Capsules on bucket keys (PAPER_ALIGNMENT_PLAN.md Phase 4): the label binding a capsule's KEM proof to its policy, the
+ * Capsules on bucket keys (docs/design.md, Capsules): the label binding a capsule's KEM proof to its policy, the
  * attested public state, and the sender's and recipient's sides. Holders release from their handover messages.
  */
 
@@ -75,7 +75,7 @@ export function handoverNeeds(p: EpochParams, pub: Public, c: bigint, t: number,
 }
 
 /**
- * Liveness margin at `round` (PAPER_ALIGNMENT_PLAN.md Phase 6): by how many seats the latest handover's agreeing
+ * Liveness margin at `round` (docs/design.md, Liveness): by how many seats the latest handover's agreeing
  * attestations, and the sizes of the committee in office and of the next one once nominated, exceed what their
  * handovers need (`handoverNeeds`). A handover with fewer honest seats speaking loses every live bucket. Undefined
  * before the first handover.

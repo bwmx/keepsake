@@ -14,7 +14,7 @@ import { b64url, vrfRank } from '../src/chain.js';
 import { claimMessage, nominationAlpha, postMessage, seatSeedContext, windows, type OrderedSeat } from '../src/epochs.js';
 import { algod, algorand, cover, deploy, lastRound, rejects, shortWindow, type Env, type Member } from './epoch-env.js';
 
-/** Each member posts a fresh nomination key for `epoch` and keeps the private half (the worker's job in Phase 3). */
+/** Each member posts a fresh nomination key for `epoch` and keeps the private half (the worker's job outside tests). */
 async function postKeys(env: Env, epoch: bigint) {
   for (const m of env.members) {
     const pair = await generateEphemeralKey();

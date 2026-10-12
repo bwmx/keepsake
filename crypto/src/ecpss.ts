@@ -12,7 +12,7 @@ import {
 
 /**
  * UNREVIEWED. Evolving-committee proactive secret sharing (eprint 2020/464 §3) over the pairing re-sharing in pvss.ts,
- * holding bucket keys as PAPER_ALIGNMENT_PLAN.md proposes: committee-generated keys, one handover message per holder
+ * holding bucket keys as docs/design.md describes: committee-generated keys, one handover message per holder
  * per epoch, reconstruction, and the capsule KEM. Chain-agnostic; chain carries the messages.
  *
  * Committees are numbered; committee c hands over to committee c + 1. A seat is a holder's evaluation point: seats are
@@ -102,7 +102,7 @@ export function seatKeys(seed: Uint8Array) {
 
 export interface Buckets { live: bigint[]; create: bigint[] }
 /**
- * How committee `committee` hands over (PAPER_ALIGNMENT_PLAN.md, packed epochs), from public data only:
+ * How committee `committee` hands over (docs/design.md, Packed epochs), from public data only:
  * - plain: one dealing per live bucket (re-sharing) and per bucket being created (contribution);
  * - pack: from an unpacked state, one dealing per holder that packs every bucket it carries (live, then created) into
  *   one polynomial of t + ℓ − 1 values; the next committee holds one packed share. Only with ℓ ≥ 2, and only if the

@@ -7,7 +7,7 @@ const VRF_BUDGET: uint64 = 6_300 // vrf_verify costs 5,700.
 const SIG_BUDGET: uint64 = 2_500 // ed25519verify_bare costs 1,900.
 // `voter_params_get` reads stake as of 320 rounds back (measured on LocalNet). Nominations end within that many rounds
 // of the seed round, so the online stake they see was fixed before the seed was known. `block` reaches about 990
-// rounds back, so the seed is still readable then (PAPER_ALIGNMENT_PLAN.md Phase 0).
+// rounds back, so the seed is still readable then (docs/results.md).
 const BALANCE_LOOKBACK: uint64 = 320
 const BATCH: uint64 = 7
 // Fraud proofs (the accountability spike): a dealing can be reported until its committee is REPORT_EPOCHS epochs past;
@@ -21,7 +21,7 @@ const FRAUD_BUDGET: uint64 = 60_000
 const NEG_G1 = Bytes.fromHex('17f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb114d1d6855d545a8aa7d76c8cf2e21f267816aef1db507c96655b9d5caac42364e6f38ba0ecb751bad54dcd6b939c2ca')
 const G2_GEN = Bytes.fromHex('024aa2b2f08f0a91260805272dc51051c6e47ad4fa403b02b4510b647ae3d1770bac0326a805bbefd48056c8c121bdb813e02b6052719f607dacd3a088274f65596bd0d09920b61ab5da61bbdc7f5049334cf11213945d57e5ac7d055d042b7e0ce5d527727d6e118cc9cdc6da2e351aadfd9baa8cbdd3a76d429a695160d12c923ac9cc3baca289e193548608b828010606c4a02ea734cc32acd2b02bc28b99cb3e287e85a763af267492ab572e99ab3f370d275cec1da1aaa9075ff05f79be')
 
-// Anyone may enroll (PAPER_ALIGNMENT_PLAN.md Phase 5). A member's sortition weight is its bond, capped by its online
+// Anyone may enroll (docs/design.md, Joining). A member's sortition weight is its bond, capped by its online
 // stake. Bond changes count from the next epoch's nominations, after a seed nobody knew when making them.
 export type Member = {
   account: Account
@@ -49,7 +49,7 @@ export type Seat = {
   finalized: boolean
 }
 
-// A capsule under bucket expiresRound / bucketRounds (Phase 4). Its key is the bucket key, used through a KEM: the
+// A capsule under bucket expiresRound / bucketRounds (docs/design.md, Capsules). Its key is the bucket key, used through a KEM: the
 // committee in office releases decryption partials, sealed to the recipient's request key, in its handover messages.
 export type CapsuleRecord = {
   sender: Account
@@ -66,10 +66,9 @@ export type CapsuleRecord = {
 }
 
 /**
- * Epoch committees for evolving-committee proactive secret sharing (eprint 2020/464 §3; PAPER_ALIGNMENT_PLAN.md
- * Phases 1 and 5). In each epoch, members win seats of the next committee by stake-weighted VRF sortition and nominate
- * them anonymously, then the current committee's holders each claim their seat and post one handover message as
- * app-call arguments. The contract orders nothing and checks no cryptography beyond sortition and seat ownership;
+ * Epoch committees for evolving-committee proactive secret sharing (eprint 2020/464 §3; docs/design.md). In each
+ * epoch, members win seats of the next committee by stake-weighted VRF sortition and nominate them anonymously, then
+ * the current committee's holders each claim their seat and post one handover message as app-call arguments. The contract orders nothing and checks no cryptography beyond sortition and seat ownership;
  * members verify messages off-chain. Every box is paid for by whoever needs it. No update/delete/opt-in handlers
  * exist, so the AVM rejects those calls.
  */

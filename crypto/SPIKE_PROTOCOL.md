@@ -1,6 +1,8 @@
-# Crypto package protocol v1
+# Legacy spike protocol v1
 
-This specifies the implemented fixed-committee demo. It does not specify the paper's ECPSS protocol, a VRF, or an Algorand contract. Public objects may be stored indefinitely. Private material must remain off-chain.
+This specifies the per-capsule spike in `src/protocol.ts`: Keepsake's first milestone, with a fixed committee of five custodians and a trusted mock ledger. **The current design does not use it.** The epoch design's wire formats are defined in `src/pvss.ts` and `src/ecpss.ts`, and described in [docs/design.md](../docs/design.md).
+
+Public objects may be stored indefinitely. Private material must remain off-chain.
 
 ## Representation and domains
 
@@ -27,7 +29,7 @@ Custodian order determines the matching position in the commitment array. The Sh
 
 `CommitteeSelection` contains `mode = fixed-demo`, `epoch = 0`, `registryReference = local-fixture`, and five custodian descriptors. This is metadata, not proof of registry admission or randomized selection.
 
-For `mode = algorand-hidden-v1` (built by `../chain`):
+For `mode = algorand-hidden-v1` (built by the removed `CapsulePolicy` app):
 - `epoch` is the beacon target round.
 - `registryReference` is `beacon:<beaconAppId>;request:<capsuleId>;registry:<snapshotSize>;randomness:<hex>`.
 - Descriptor `id`s are `slot-0`…`slot-4`. Their keys are one-time holder keys from `Custodian.fromSeed(id, seed)`: the seed goes through HKDF-SHA256 (salt `capsule/holder-keys/v1`, info `hpke` / `ed25519`), then RFC 9180 DeriveKeyPair for X25519 and an Ed25519 seed.
@@ -97,20 +99,6 @@ Thus modifying recipient keys, request IDs, custodian labels, capsule domains, e
 
 The demo retains the recipient key long enough to demonstrate that old responses still decrypt after expiry. This is intentional. A recipient's retention policy is outside custodian enforcement.
 
-## Integration status
+## Status
 
-Implemented on LocalNet in `../chain`:
-- the AlgoKit/Puya TS application, with authenticated activation and access requests;
-- network/app domain binding and fresh chain-state verification that fails closed;
-- beacon VRF committee selection bound into the manifest hash;
-- hidden one-time holder keys nominated by VRF sortition seeded by the beacon;
-- per-epoch nomination keys: each capsule binds to its registration epoch, and members keep that epoch's key only in memory and erase it once every capsule of the epoch has closed nominations;
-- all custody traffic carried on the chain (no worker network API);
-- worker lifecycle with relayed one-time-key acknowledgments and releases, and round-driven expiry;
-- an explicit restart policy: custody is lost on restart, because the new process has fresh nomination keys and cannot reopen the on-chain seeds.
-
-Still required:
-- Network-level privacy for chain reads and relayed submissions; key-privacy and selective-opening review of HPKE for nominations.
-- Separate nodes, hosts and operators per custodian.
-- Explicit policy for persistence, key recovery, user cancellation and data retention. These can change the secrecy/availability assumptions.
-- Protocol review before treating this as production key management.
+The spike's on-chain side, `algorand-hidden-v1` (the `CapsulePolicy` app with beacon-seeded hidden committees and a relayer), was removed on 2026-10-10 in favour of the epoch design; see [docs/history.md](../docs/history.md). The spike itself still builds and passes its tests against the mock ledger. It was never meant for real secrets.

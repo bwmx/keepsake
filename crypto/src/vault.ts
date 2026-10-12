@@ -4,7 +4,7 @@ import type { Buckets, Recipe } from './ecpss.js';
 import { decodeG2, type G2Point } from './pvss.js';
 
 /**
- * One short-lived process per committee's secrets (PAPER_ALIGNMENT_PLAN.md Phase 6). A member starts a vault when it
+ * One short-lived process per committee's secrets (docs/design.md, Vaults). A member starts a vault when it
  * posts its nomination key for an epoch. The vault opens the seats nominated to that key, receives their shares at the
  * handover into the committee, builds their single handover messages, and exits. The member's long-running process
  * sees only public data, its own seat numbers, and the messages and claim signatures it posts.

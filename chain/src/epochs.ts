@@ -8,7 +8,7 @@ import {
 import { ChainReader, hex, type ChainPins } from './chain.js';
 
 /**
- * Off-chain side of the EpochCommittee app (PAPER_ALIGNMENT_PLAN.md Phase 1): its round windows, shared message
+ * Off-chain side of the EpochCommittee app (docs/design.md): its round windows, shared message
  * formats, seat ordering, and handover messages posted as chunks and rebuilt from block data.
  */
 export type { CapsuleRecord, Member, Seat };
@@ -93,7 +93,7 @@ const ARG_OVERHEAD = 36, PART = 4_087, NOTE = 4_096;
 const SIG_BUDGET = 2_500; // The contract's ensureBudget before ed25519verify_bare in `claim`.
 export const CHUNK = 4 * PART + NOTE;
 
-/** The fee measured on LocalNet in Phase 0: 1,000 µAlgo plus 0.1 µAlgo per byte beyond 2,048 argument and 1,024 note bytes. */
+/** The fee measured on LocalNet (docs/results.md): 1,000 µAlgo plus 0.1 µAlgo per byte beyond 2,048 argument and 1,024 note bytes. */
 // ponytail: measured on an idle LocalNet; read the network's actual fee rule before TestNet.
 export const chunkFee = (argBytes: number, noteBytes: number) =>
   1_000 + Math.ceil((Math.max(0, argBytes - 2_048) + Math.max(0, noteBytes - 1_024)) / 10);

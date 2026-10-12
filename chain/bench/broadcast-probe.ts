@@ -5,7 +5,7 @@ import { encodeUint64 } from 'algosdk';
 import { BroadcastProbeFactory } from '../smart_contracts/artifacts/broadcast_probe/BroadcastProbeClient.js';
 
 /**
- * PHASE 0 LocalNet probe (PAPER_ALIGNMENT_PLAN.md): app-call argument and note limits and their fees, posting one
+ * FEASIBILITY PROBE, LocalNet only (docs/results.md): app-call argument and note limits and their fees, posting one
  * epoch's handover data, rebuilding it from blocks through algod, the block-seed lookback, and the stake opcodes.
  */
 Config.configure({ logger: nullLogger, populateAppCallResources: false });

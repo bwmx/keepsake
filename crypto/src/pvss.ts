@@ -4,7 +4,7 @@ import { pippenger } from '@noble/curves/abstract/curve.js';
 import { bls12_381 as bls } from '@noble/curves/bls12-381.js';
 
 /**
- * UNREVIEWED: the pairing-based re-sharing sketched in PAPER_ALIGNMENT_PLAN.md (decision D2). Not for real secrets.
+ * UNREVIEWED: the pairing-based re-sharing described in docs/design.md (The cryptography). Not for real secrets.
  *
  * A secret is a G2 element S = s·g2 with public key P = s·g1. A holder's share is σ·g2 with public commitment σ·g1.
  * A dealer sends each next-committee seat its subshare ElGamal-encrypted in G2 to that seat's ephemeral key, plus

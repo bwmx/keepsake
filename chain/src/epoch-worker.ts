@@ -32,7 +32,7 @@ export interface EpochWorkerConfig {
 interface MySeat extends SeatId { seat: number }
 
 /**
- * A member of the EpochCommittee app (PAPER_ALIGNMENT_PLAN.md Phases 3 and 5). Each step, it:
+ * A member of the EpochCommittee app (docs/design.md). Each step, it:
  * - posts its nomination keys for the current and next epoch;
  * - nominates one seat per winning sortition ticket (§3.1.2), each sealed to a member chosen at random by bond;
  * - opens its seats once nominations close, then erases that epoch's key;
@@ -42,7 +42,7 @@ interface MySeat extends SeatId { seat: number }
  * - processes every handover whose window has closed, in order (catching up after an outage while the blocks and
  *   seat records last), verifying on the thread pool, and combines shares for its seats in the next committee;
  * - deletes the seats it nominated once they are old, recovering their deposits.
- * Secrets live in one short-lived vault process per committee (PAPER_ALIGNMENT_PLAN.md Phase 6): the nomination key
+ * Secrets live in one short-lived vault process per committee (docs/design.md, Vaults): the nomination key
  * for the epoch that nominates it, its seats' one-time keys and its shares. The vault exits once its seats have their
  * messages, before any is posted; this process holds only public data.
  * A member that starts after genesis, newly enrolled or restarted with nothing in memory, joins from the latest public

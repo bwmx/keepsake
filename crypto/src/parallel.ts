@@ -6,7 +6,7 @@ import type { G2Point } from './pvss.js';
 /**
  * Receiving a handover on every core. The costly part, a subgroup check per received point plus the batched pairing
  * checks, runs in threads over disjoint groups of dealers. The caller's thread then decodes only what it uses (the
- * chosen dealings' commitments and its own subshares) and combines (see PAPER_ALIGNMENT_PLAN.md, Phase 3).
+ * chosen dealings' commitments and its own subshares) and combines (see docs/results.md, Compute per member).
  */
 export interface Task {
   n: number; t: number; committee: string; epks: Uint8Array[];
