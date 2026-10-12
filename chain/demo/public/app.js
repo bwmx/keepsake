@@ -150,11 +150,13 @@ function renderRisk() {
   if (!state?.ready) return;
   const f = Number($('corrupt').value) / 100, C = state.epoch.inOffice || state.env.committee, t = state.env.t;
   $('fOut').textContent = `${Math.round(f * 100)}%`;
-  const exposed = 1 - below(C * f * (2 - f), t), stuck = below(C * (1 - f) ** 2, t);
+  // Handovers pack every other epoch; unpacking ℓ buckets needs t + ℓ − 1 honest seats instead of t.
+  const l = Math.max(1, state.history?.[0]?.buckets.length ?? 1), need = C >= t + l - 1 ? t + l - 1 : t;
+  const exposed = 1 - below(C * f * (2 - f), t), stuck = below(C * (1 - f) ** 2, need);
   view($('riskBars')).html = [['Key exposed', exposed, 'var(--bad)'], ['Handover fails', stuck, 'var(--warn)']].map(([label, p, color]) =>
     `<div class="bar"><span>${label}</span><div class="fill"><div style="width:${Math.max(1, p * 100)}%;background:${color}"></div></div><b>${pct(p)}</b></div>`).join('');
   $('riskNote').textContent = `Per epoch, for a committee of about ${C} seats and threshold ${t}. A seat is corrupt if its nominator or its holder is (about 2f). ` +
-    `Exposure needs t corrupt seats; a handover fails without t honest ones. Demo-sized committees are weak: the plan's parameters are C ≈ 130–210.`;
+    `Exposure needs t corrupt seats; a handover fails without ${need} honest ones (t + ℓ − 1 when it unpacks ℓ = ${l} packed buckets). Demo-sized committees are weak: the plan's parameters are C ≈ 130–210.`;
 }
 
 function renderLog() {

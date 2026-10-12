@@ -99,7 +99,8 @@ function narrate() {
   for (const e of events.slice(seenEvents)) {
     const who = `Member #${e.member}`;
     if (e.received) {
-      once(`r${e.received}`, () => say(`Committee ${e.received} handed over to committee ${BigInt(String(e.received)) + 1n}: ${e.messages} messages checked by every member. ` +
+      const how = e.mode === 'pack' ? ' Each seat packed every bucket into one dealing.' : e.mode === 'unpack' ? ' Each seat re-shared its one packed share, and the next committee unpacked it per bucket.' : '';
+      once(`r${e.received}`, () => say(`Committee ${e.received} handed over to committee ${BigInt(String(e.received)) + 1n}: ${e.messages} messages checked by every member.${how} ` +
         `Buckets now held: ${String(e.keys).split(',').filter(Boolean).map(kv => kv.split(':')[0]).join(', ') || 'none'}.${e.lost ? ` LOST: ${e.lost}.` : ''}` +
         (Number(e.margin) <= 0 && !e.lost ? ' Margin 0: one more silent seat would have lost buckets, so new capsules are refused until it recovers.' : ''),
       { tone: e.lost ? 'bad' : Number(e.margin) <= 0 ? 'warn' : 'ok' }));

@@ -16,3 +16,9 @@ test('exact tails give smaller committees than the paper bounds and grow with re
   assert.ok(exactBound(0.05, 0, 64, 64).C < exactBound(0.05, 64, 64, 64).C);
   assert.ok(exactBound(0.05, 0, 64, 64).C < exactBound(0.10, 0, 64, 64).C);
 });
+
+test('packed epochs: unpacking ℓ buckets needs t + ℓ − 1 honest seats, which costs a few seats of committee size', () => {
+  const plain = exactBound(0.05, 0, 40, 40), packed = exactBound(0.05, 0, 40, 40, 3);
+  assert.ok(packed.C > plain.C && packed.C <= plain.C + 8, `${packed.C} vs ${plain.C}`);
+  assert.ok(packed.t >= plain.t);
+});

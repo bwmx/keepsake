@@ -2,9 +2,9 @@ import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { b64, deriveEphemeralKey, open, seal, unb64 } from './crypto.js';
-import { adopt, capsulePartial, decodeMessage, encodeMessage, encodeState, handover, seatKeys, type Holder } from './ecpss.js';
+import { adopt, capsulePartial, decodeMessage, decodeState, encodeMessage, handover, seatKeys, shareCommitment, type Holder } from './ecpss.js';
 import { avmG2, dealingsRoot } from './fraud.js';
-import { decodeG1, decodeG2, decodeProof, encodePartial, point, seatCommitment } from './pvss.js';
+import { decodeG1, decodeG2, decodeProof, encodePartial, point } from './pvss.js';
 import type { Request, SeatInput, SpeakInput } from './vault.js';
 
 /**
@@ -54,24 +54,24 @@ async function openSeats(seats: SeatInput[]) {
 
 /** Each held seat's single message, its claim signature, and the capsule partials it releases. */
 async function speak(o: SpeakInput) {
-  const pub = new Map([...o.pub].map(([b, poly]) => [b, poly.map(decodeG1)])), next = o.next.map(decodeG2), state = encodeState(pub);
+  const pub = decodeState(o.state, o.t), next = o.next.map(decodeG2);
   const encoded = next.map(avmG2);
   const posts = [];
   for (const h of holders) {
     const releases = new Map<bigint, Uint8Array>(), refused: [bigint, string][] = [];
     for (const c of o.capsules) {
       try {
-        const p = capsulePartial(h.shares.get(c.bucket)!, seatCommitment(pub.get(c.bucket)!, h.seat), decodeG1(c.u), decodeProof(c.proof), c.label);
+        const p = capsulePartial(h.shares.get(c.bucket)!, shareCommitment(pub.get(c.bucket)!, h.seat), decodeG1(c.u), decodeProof(c.proof), c.label);
         const sealed = await seal(c.recipientKey, encodePartial(p), Buffer.from(c.contexts.get(h.seat)!));
         releases.set(c.id, Buffer.concat([unb64(sealed.enc), unb64(sealed.ciphertext)]));
       } catch (e) {
         refused.push([c.id, e instanceof Error ? e.message : String(e)]); // E.g. a u copied under another policy.
       }
     }
-    const dealings = handover(h, pub, o.committee, { live: o.buckets.live.filter(b => pub.has(b)), create: o.buckets.create }, next, o.t);
-    const first = [...dealings.reshares.values(), ...dealings.contributions.values()][0];
+    const dealings = handover(h, pub, o.committee, o.buckets, next, o.t);
+    const first = [...dealings.reshares.values(), ...dealings.contributions.values(), dealings.pack, dealings.unpack].find(d => d);
     if (cheat && first?.subshares[0]) first.subshares[0] = { ...first.subshares[0], b: first.subshares[0].b.add(point.g2(1n)) };
-    const message = encodeMessage({ ...dealings, releases, state }), root = dealingsRoot(dealings, encoded);
+    const message = encodeMessage({ ...dealings, releases, state: o.state }), root = dealingsRoot(dealings, encoded);
     const signature = mine.find(m => m.seat === h.seat)!.sign(Buffer.concat([o.claims.get(h.seat)!, root])); // The holder answers for the root.
     posts.push({ seat: h.seat, message, root, signature, releases: [...releases.keys()], refused });
   }
@@ -87,7 +87,7 @@ async function handle(r: Request): Promise<unknown> {
     case 'adopt': {
       const keep = mine.map(m => m.seat);
       const messages = new Map([...r.messages].map(([s, bytes]) => [s, decodeMessage(bytes, s, r.n, r.t, keep)]));
-      holders = adopt(messages, r.used, r.buckets, r.t, mine.map(m => ({ seat: m.seat, x: m.x }))).holders;
+      holders = adopt(messages, r.used, mine.map(m => ({ seat: m.seat, x: m.x }))).holders;
       // Audit mode (tests): the operator sees its shares. Never in a deployment.
       return audit ? holders.map(h => ({ seat: h.seat, shares: new Map([...h.shares].map(([b, s]) => [b, s.toBytes()])) })) : undefined;
     }

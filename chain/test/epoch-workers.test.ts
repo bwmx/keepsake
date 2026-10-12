@@ -32,8 +32,8 @@ test('workers run 22 handovers on LocalNet: every bucket survives changing commi
     const views = workers.map(w => w.view(c)).filter(v => v !== undefined);
     if (!views.length || secrets.has(c)) return;
     const shares = views.flatMap(v => v.holders ?? []); // Audit mode: the vaults report their shares.
-    secrets.set(c, new Map([...views[0]!.pub].map(([b, poly]) =>
-      [b, reconstruct(poly, shares.filter(h => h.shares.has(b)).map(h => ({ seat: h.seat, share: h.shares.get(b)! })), t)])));
+    secrets.set(c, new Map([...views[0]!.pub].map(([b, sharing]) =>
+      [b, reconstruct(sharing, shares.filter(h => h.shares.has(b)).map(h => ({ seat: h.seat, share: h.shares.get(b)! })))])));
   };
 
   try {

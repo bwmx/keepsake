@@ -8,7 +8,7 @@ import {
   dealerGenesis, decodeMessage, encodeMessage, encodeState, handover, receive, reconstruct, seatKeys, stateDigest, type Message,
 } from 'keepsake-crypto/dist/src/ecpss.js';
 import { avmG1, avmG2, dealingsRoot, findBadDealing, merklePath, messageLeaves, type FraudProof } from 'keepsake-crypto/dist/src/fraud.js';
-import { decodeG2, point } from 'keepsake-crypto/dist/src/pvss.js';
+import { decodeG2, point, seatCommitment } from 'keepsake-crypto/dist/src/pvss.js';
 import { EpochCommitteeFactory } from '../smart_contracts/artifacts/epoch_committee/EpochCommitteeClient.js';
 import { b64url, vrfRank } from '../src/chain.js';
 import { claimMessage, nominationAlpha, postMessage, seatSeedContext, windows, type OrderedSeat } from '../src/epochs.js';
@@ -122,11 +122,12 @@ test('handover on chain: holders claim seats and post one message each; readers 
   const keys2 = seats2.map(s => s.keys.epk);
   const buckets = { live: [1n], create: [2n] };
 
-  // Holders build their dealings and sign their roots. Two misbehave. The cheater posts 50 KB of garbage in three
-  // chunks instead of a handover message; it cannot be proven against. The liar re-shares bucket 1 with a wrong
-  // subshare for recipient 2, under a root over what it posts, so its own claim convicts it.
+  // Holders build their dealings (two buckets for six seats: each packs both into one dealing) and sign their roots.
+  // Two misbehave. The cheater posts 50 KB of garbage in three chunks instead of a handover message; it cannot be
+  // proven against. The liar deals recipient 2 a wrong subshare, under a root over what it posts, so its own claim
+  // convicts it.
   const encoded = keys2.map(avmG2), dealings = new Map(seats1.map(s => [s.seat, handover(state.holders.find(h => h.seat === s.seat)!, state.pub, c1, buckets, keys2, t)]));
-  const lie = dealings.get(liar.seat)!.reshares.get(1n)!;
+  const lie = dealings.get(liar.seat)!.pack!;
   lie.subshares[1] = { ...lie.subshares[1]!, b: lie.subshares[1]!.b.add(point.g2(1n)) };
   for (const s of seats1) roots.set(s.seat, s === cheater ? randomBytes(32) : dealingsRoot(dealings.get(s.seat)!, encoded));
   assert.equal((await lastRound()) + 1n, windows(env.params, c1).handover[0]);
@@ -157,22 +158,22 @@ test('handover on chain: holders claim seats and post one message each; readers 
   }
   const next = receive(messages, state.pub, c1, buckets, keys2, t, seats2.map(s => ({ seat: s.seat, x: s.keys.x })));
   assert.deepEqual(next.lost, []);
-  assert.ok(!next.used.get(1n)!.includes(cheater.seat) && !next.used.get(1n)!.includes(liar.seat));
+  assert.ok(!next.used.get(1n)!.seats.includes(cheater.seat) && !next.used.get(1n)!.seats.includes(liar.seat));
   const shares = (b: bigint) => next.holders.map(h => ({ seat: h.seat, share: h.shares.get(b)! }));
-  assert.ok(reconstruct(next.pub.get(1n)!, shares(1n), t).equals(genesis.secret));
-  reconstruct(next.pub.get(2n)!, shares(2n), t); // The committee-generated bucket is consistent with its commitments.
+  assert.ok(reconstruct(next.pub.get(1n)!, shares(1n)).equals(genesis.secret));
+  reconstruct(next.pub.get(2n)!, shares(2n)); // The committee-generated bucket is consistent with its commitments.
 
   // Anyone proves the liar's bad subshare on chain: its holder loses the whole bond and the reporter gets half.
   const reporter = await env.fund(), bond = async (m: Member) => (await env.app.getMember({ args: { index: m.index } })).nextBond;
   const accuse = (s: (typeof seats1)[number], p: FraudProof) => env.app.send.reportBadDealing({ sender: reporter, coverAppCallInnerTransactionFees: true,
-    maxFee: microAlgo(250_000), args: { committee: c1, nominator: s.nominator, ticket: s.ticket, index: BigInt(p.index), path: p.path, bucket: p.bucket,
-      kind: BigInt(p.kind), k: BigInt(p.k), epk: p.epk, commitments: p.commitments, r1: p.r1, r2: p.r2, b: p.b } });
-  const proof = findBadDealing(messages.get(liar.seat)!, keys2, t)!;
-  assert.deepEqual([proof.bucket, proof.kind, proof.k], [1n, 0, 2]);
+    maxFee: microAlgo(250_000), args: { committee: c1, nominator: s.nominator, ticket: s.ticket, index: BigInt(p.index), path: p.path, id: p.id,
+      kind: BigInt(p.kind), k: BigInt(p.k), epk: p.epk, expected: p.expected, r1: p.r1, r2: p.r2, b: p.b } });
+  const proof = findBadDealing(messages.get(liar.seat)!, keys2, roots.get(liar.seat)!)!;
+  assert.deepEqual([proof.id, proof.kind, proof.k], [0n, 4, 2]);
   // An honest leaf cannot convict, a proof under another seat's root fails, and a forged index fails.
-  const honest = messageLeaves(messages.get(first.seat)!, encoded), d0 = messages.get(first.seat)!.reshares.get(1n)!, s0 = d0.subshares[0]!;
-  const fair: FraudProof = { index: 0, path: Buffer.concat(merklePath(honest, 0)), bucket: 1n, kind: 0, k: 1, epk: encoded[0]!, // Bucket 1, recipient 1.
-    commitments: Buffer.concat(d0.commitments.map(avmG1)), r1: avmG1(s0.r1), r2: avmG2(s0.r2), b: avmG2(s0.b) };
+  const honest = messageLeaves(messages.get(first.seat)!, encoded), d0 = messages.get(first.seat)!.pack!, s0 = d0.subshares[0]!;
+  const fair: FraudProof = { index: 0, path: Buffer.concat(merklePath(honest, 0)), id: 0n, kind: 4, k: 1, epk: encoded[0]!, // The pack, recipient 1.
+    expected: avmG1(seatCommitment(d0.commitments, 1, 'evaluations')), r1: avmG1(s0.r1), r2: avmG2(s0.r2), b: avmG2(s0.b) };
   await rejects(accuse(first, fair), 'Dealing is valid');
   await rejects(accuse(first, proof), 'Not under the holder');
   await rejects(accuse(liar, { ...proof, index: proof.index + 1 }), 'Not under the holder');
@@ -181,7 +182,7 @@ test('handover on chain: holders claim seats and post one message each; readers 
   const after = await algod.accountInformation(reporter.addr).do();
   assert.equal(await bond(liar.holder), 0n);
   assert.equal(after.amount - before.amount, slashed / 2n - transaction.fee); // Half the bond, less the report's fee.
-  console.log(`fraud proof: fee ${transaction.fee} µAlgo (t = ${t})`);
+  console.log(`fraud proof: fee ${transaction.fee} µAlgo (any t)`);
   await rejects(accuse(liar, proof), 'Nothing to slash');
 
   // Old seats go once the reporting window is over: each nominator deletes its own and gets the deposit back.

@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import type { Buckets } from './ecpss.js';
+import type { Buckets, Recipe } from './ecpss.js';
 import { decodeG2, type G2Point } from './pvss.js';
 
 /**
@@ -19,7 +19,7 @@ export interface CapsuleInput {
   recipientKey: string; contexts: Map<number, Uint8Array>; // HPKE context per seat
 }
 export interface SpeakInput {
-  committee: bigint; pub: Map<bigint, Uint8Array[]>; buckets: Buckets; next: Uint8Array[]; t: number;
+  committee: bigint; state: Uint8Array; buckets: Buckets; next: Uint8Array[]; t: number; // state: the committee's (encodeState)
   claims: Map<number, Uint8Array>; // per seat, the claim message its one-time key signs, less its last field: the dealings root
   capsules: CapsuleInput[];
 }
@@ -30,7 +30,7 @@ export interface Post {
 export type Request =
   | { op: 'open'; seats: SeatInput[] }
   | { op: 'genesis' }
-  | { op: 'adopt'; messages: Map<number, Uint8Array>; used: Map<bigint, number[]>; buckets: Buckets; n: number; t: number }
+  | { op: 'adopt'; messages: Map<number, Uint8Array>; used: Map<bigint, Recipe>; n: number; t: number }
   | ({ op: 'speak' } & SpeakInput);
 
 export class SeatVault {
@@ -74,11 +74,11 @@ export class SeatVault {
   /** The genesis committee holds no buckets. */
   genesis() { return this.#call<void>({ op: 'genesis' }); }
   /**
-   * Shares for this vault's seats from the dealings the member chose (`used`: per bucket, the first t valid dealers),
-   * given those dealers' raw messages. In audit mode, returns the shares.
+   * Shares for this vault's seats from the dealings the member chose (`used`: per bucket, its recipe from ecpss
+   * `choose`), given those dealers' raw messages. In audit mode, returns the shares.
    */
-  async adopt(messages: Map<number, Uint8Array>, used: Map<bigint, number[]>, buckets: Buckets, n: number, t: number) {
-    const shares = await this.#call<{ seat: number; shares: Map<bigint, Uint8Array> }[] | undefined>({ op: 'adopt', messages, used, buckets, n, t });
+  async adopt(messages: Map<number, Uint8Array>, used: Map<bigint, Recipe>, n: number, t: number) {
+    const shares = await this.#call<{ seat: number; shares: Map<bigint, Uint8Array> }[] | undefined>({ op: 'adopt', messages, used, n, t });
     return shares?.map(h => ({ seat: h.seat, shares: new Map<bigint, G2Point>([...h.shares].map(([b, s]) => [b, decodeG2(s)])) }));
   }
   /** Every held seat's handover message and claim signature. The vault exits before the caller posts any of them. */

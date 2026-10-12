@@ -21,6 +21,7 @@ function fastDeal(dealer: number, sigma: bigint, commitment: G1Point, next: bigi
       const r = randomScalar();
       return { r1: point.g1(r), r2: point.g2(r), b: point.g2(fr.create(sigma + evaluate(a, BigInt(i + 1)) + r * x)) };
     }),
+    proofs: [],
   };
 }
 
@@ -29,12 +30,12 @@ const pool = new VerifyPool();
 for (const [C, t] of [[64, 16], [120, 44], [200, 72]] as const) {
   const F = Array.from({ length: t }, () => randomScalar());
   const sigma = Array.from({ length: C }, (_, j) => evaluate(F, BigInt(j + 1)));
-  const prior = new Map(sigma.map((s, j) => [j + 1, point.g1(s)]));
+  const prior = new Map(sigma.map((s, j) => [j + 1, [point.g1(s)]]));
   const next = Array.from({ length: C }, () => randomScalar());
   const epks = next.map(point.g2);
 
-  const [first, dealMs] = time(() => deal(1, point.g2(sigma[0]!), prior.get(1)!, epks, t));
-  const dealings = [first, ...sigma.slice(1).map((s, i) => fastDeal(i + 2, s, prior.get(i + 2)!, next, t))];
+  const [first, dealMs] = time(() => deal(1, [{ share: point.g2(sigma[0]!), commitment: prior.get(1)![0]! }], epks, t));
+  const dealings = [first, ...sigma.slice(1).map((s, i) => fastDeal(i + 2, s, prior.get(i + 2)![0]!, next, t))];
   const [valid, verifyMs] = time(() => validDealings(dealings, epks, t, { prior }));
   assert.equal(valid.length, C);
   const bad = dealings.map((d, j) => (j === C >> 1 ? { ...d, subshares: d.subshares.map((s, k) => (k === 0 ? { ...s, b: s.b.add(point.g2(1n)) } : s)) } : d));
@@ -43,8 +44,8 @@ for (const [C, t] of [[64, 16], [120, 44], [200, 72]] as const) {
 
   // From the wire: every point is decoded with a subgroup check, then verified, on all cores.
   const raw = new Map(dealings.map(d => [d.dealer, encodeMessage({ reshares: new Map([[1n, d]]), contributions: new Map() })]));
-  const [, decodeOneMs] = time(() => decodeDealing(encodeDealing(first), 1, C, t, false));
-  const pub = new Map([[1n, [point.g1(F[0]!), ...F.slice(1).map(point.g1)]]]);
+  const [, decodeOneMs] = time(() => decodeDealing(encodeDealing(first), 1, C, t, 0));
+  const pub = new Map([[1n, { poly: [point.g1(F[0]!), ...F.slice(1).map(point.g1)], slot: 0 }]]);
   const parallelStart = performance.now();
   const received = await receiveParallel(pool, raw, pub, 1n, { live: [1n], create: [] }, epks, t, [{ seat: 1, x: next[0]! }]);
   const parallelMs = performance.now() - parallelStart;
@@ -61,7 +62,7 @@ for (const [C, t] of [[64, 16], [120, 44], [200, 72]] as const) {
   // Timing only: t copies of one partial cost the same as t distinct ones.
   const [, combinePartialsMs] = time(() => combinePartials(Array.from({ length: t }, (_, i) => ({ seat: i + 1, d: part.d }))));
 
-  const bytes = dealingSize(C, t, false);
+  const bytes = dealingSize(C, t, 0);
   rows.push({ C, t, dealMs, decodeOneMs, parallelMs, verifyMs, verifyBadMs, combineMs, partialMs, verifyPartialMs, combinePartialsMs, dealingKB: bytes / 1024, epochMB: (C * bytes) / 2 ** 20 });
   console.error(`C = ${C} done`);
 }

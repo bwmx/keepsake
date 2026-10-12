@@ -352,7 +352,7 @@ The first half of eprint 2026/919's route to smaller committees: holders answer 
 - **How the contract checks it without reading the message.** Each holder signs, in its claim, a Merkle root over one leaf per (dealing, recipient). A leaf holds the bucket, kind, recipient seat k and its key, the hash of the dealing's commitments, and the subshare, all in the encoding `ec_*` opcodes take. `reportBadDealing` checks the leaf's path to the root, computes Σ k^l·A_l with `ec_multi_scalar_mul`, and runs two `ec_pairing_check`s. The leaf carries the recipient's key and k, so the contract never needs the next committee's seat order.
 - **Why honest holders are safe.** Every honest leaf passes both checks, and a path needs the holder's own root. Verifiers drop any message whose dealings do not match its signed root, which counts as silence, so a lying root cannot frame anyone either.
 - **Penalty.** The holder's whole bond, including withdrawals still unbonding, half to the reporter. Withdrawals now wait four epochs, and seats cannot be deleted for two epochs after their committee, so evidence and bond both outlast the reporting window.
-- **Cost.** About 0.11 Algo per report at t = 3 (105 budget top-ups). Putting G2 points first in `ec_pairing_check` matters: costs are 10,000 per 192 bytes of the second group's points, so G1 there is four times cheaper than G2. At most 42 commitments fit one AVM value, so production t (50–79) needs the multi-scalar multiplication split.
+- **Cost.** About 0.11 Algo per report at t = 3 (105 budget top-ups). Putting G2 points first in `ec_pairing_check` matters: costs are 10,000 per 192 bytes of the second group's points, so G1 there is four times cheaper than G2. At most 42 commitments fit one AVM value, so production t (50–79) did not fit; see Production thresholds and packed epochs for the fix (0.09 Algo at any t), and for why this slashing turned out to be evadable.
 - **Tests.**
   - `test/epochs.test.ts` convicts a liar by hand: half the bond goes to the reporter. Reports against an honest leaf, under another root, with a forged index, or twice all fail.
   - `test/epoch-slash.test.ts` runs a cheating member, from a test-only vault mode, among seven honest workers. They report it and it is slashed; nothing is lost; afterwards it wins no tickets and holds no seats. The test passed many times in a row once the setup had eight members. With six, a lone cheater holding four of the six seats left fewer than t valid dealings, as the threshold model predicts.
@@ -365,6 +365,53 @@ The first half of eprint 2026/919's route to smaller committees: holders answer 
   - bad contribution proofs;
   - garbled messages;
   - fixed-size committees.
+
+## Production thresholds and packed epochs (done 2026-10-12)
+
+Two changes, both unreviewed: fraud proofs that work at production t, and handovers that carry one dealing per holder for all live buckets.
+
+**Fraud proofs at production t.**
+- **What broke.** The contract recomputed the recipient's commitment Σ k^l·A_l from all t commitments. An AVM value holds at most 4,096 bytes, which is 42 G1 points, so production t (50–80) did not fit.
+- **The fix.** Each leaf now carries E, the commitment the recipient's subshare should open to (`ecpss/leaf/v2`). `reportBadDealing` checks the path and two pairings, e(r1, g2) = e(g1, r2) and e(g1, b) = e(E, g2)·e(r1, epk), with no multi-scalar multiplication and nothing that depends on t. A report costs 0.09 Algo at any t, against 0.106 Algo before at t = 3. Its opcode budget (60,000) is reserved before the Merkle walk, so deep trees fit.
+- **Honest holders are still safe.** An honest holder signs only leaves that pass. A leaf whose E or key does not match the dealing is the holder's own signature on something inconsistent.
+- **Finding: the slashing is evadable.** A rational cheater signs a root that leaves its bad subshare out, or names an E that its subshare matches. Its message is then just dropped, the same as silence, and nothing is slashed. The accountability spike overstated deterrence. Real deterrence needs a penalty for not delivering, which is the time-lock-puzzle half of eprint 2026/919.
+- **Verifiers stop checking roots.** Checking would cost them a multi-scalar multiplication per leaf at production size, and it buys nothing for safety: a message is judged on its dealings alone. The dealer computes its leaves cheaply while dealing. A reporter rebuilds leaves only for a message it is about to report.
+
+**Packed epochs: one dealing per holder for all live buckets.**
+- **Why not one packed polynomial throughout.** Re-sharing a packed share to a packed one needs per-bucket weights that depend on which dealers turn out valid, so no dealer can compute them in advance.
+- **Alternate instead** (`handoverPlan` in `crypto/src/ecpss.ts`):
+  - **Pack.** From an unpacked state, each holder deals one polynomial of m = t + ℓ − 1 values in evaluation form over the points −1…−m. Its shares of the ℓ live buckets come first, then a contribution z·g2 for each new bucket (with a proof of knowledge), then t − 1 random values. The first t valid dealings, weighted by Lagrange coefficients at 0, give the next committee one packed share F(k). F(−s) holds bucket s's secret, and C_(s−1) is its public key, which never changes.
+  - **Unpack.** From a packed state, each holder re-shares F(k) as an ordinary dealing. Recipients interpolate each live bucket's share at −s from the first t + ℓ − 1 valid dealings, and new buckets come from separate contributions.
+  - **When it applies.** A committee packs only with ℓ ≥ 2, and only if the next committee has the t + ℓ − 1 seats its own handover will need.
+- **Secrecy is unchanged.** Any t − 1 packed shares are independent of the secrets, since the t − 1 random values mask them, so secrecy still needs fewer than t corrupt seats.
+- **Liveness costs a little.** Unpacking needs t + ℓ − 1 valid dealings, and a capsule released by a packed committee needs t + ℓ − 1 partials. At f = 5% with 2^8 redraws and 2^-64 per epoch (`npm run params`), C grows from 210 to 216 with four packed buckets, 220 with five and 226 with eight.
+- **Other costs.**
+  - **Expiry can lag one epoch.** A bucket that expires at an unpack still rides in the packed shares being re-shared, so it is gone only once the next committee erases.
+  - **A packed committee's partials serve every bucket of the pack.** A recipient of one capsule's partials can also compute e(u, S) for the pack's other buckets. That is the key a capsule with this very u would have under them, and only this capsule's sender, who knows u's discrete log, could make one.
+- **The wire and the state.** New message entries are 4 (pack) and 5 (unpack). The attested state is one entry, with a packed polynomial encoded once (`ecpss/state/v2`). Holders, workers, vaults, the capsule client and the liveness margin all read a bucket's sharing (`Sharing`: commitments and slot) instead of a coefficient list.
+- **Measured** (`npm run bench:packed` in `crypto/`; Apple M5, single-threaded, C = 64, t = 16, four live buckets and one new per epoch):
+
+  | Handover | Dealings per member | Deal (one member) | Message | Decode + verify all 64 |
+  | --- | --- | --- | --- | --- |
+  | plain | 5 | 2.1 s | 79 KB | 91.2 s |
+  | pack | 1 | 1.4 s | 16 KB | 19.7 s |
+  | unpack | 2 | 0.9 s | 32 KB | 36.6 s |
+
+  Over two epochs, verification falls by 69% and message bytes by 70%. At production sizes the message sizes follow from the wire format:
+
+  | C, t | Live + new buckets | Plain | Pack | Unpack | Saving over two epochs |
+  | --- | --- | --- | --- | --- | --- |
+  | 210, 79 | 4 + 1 | 265 KB | 53 KB | 106 KB | 70% |
+  | 216, 80 | 4 + 1 | 272 KB | 55 KB | 109 KB | 70% |
+  | 220, 81 | 5 + 1 | 332 KB | 56 KB | 111 KB | 75% |
+  | 226, 82 | 8 + 1 | 511 KB | 57 KB | 114 KB | 83% |
+
+  Unpacked, a production message with four live buckets plus the attested state is about 286,000 bytes, which is 15 chunks of 20,444 bytes. That is one more than fits in one atomic group (14), so it could not post as a single group. Packed, it needs 4 chunks on a pack and 6 on an unpack, so chunk fees per seat fall by about two thirds.
+- **Tests.**
+  - `crypto/test/ecpss.test.ts` runs ten handovers with random committees and cheaters. The modes go plain, then pack and unpack in turn, with one dealing per honest holder for all live buckets, and a pack needs t + ℓ − 1 shares. It also has the KEM on a packed state, and wire and state decoding.
+  - `crypto/test/pvss.test.ts` checks evaluation-form dealings.
+  - `crypto/test/vault.test.ts` passes a pack and an unpack through vault processes, with a release from the packed committee.
+  - On LocalNet, every chain test now packs and unpacks, including the 22-handover worker run, the fraud report and the liveness test, whose need is now t or t + ℓ − 1. The capsule test went from about 80 to 45 seconds.
 
 ## Crypto sketch for D2 (review before implementing)
 
@@ -468,6 +515,7 @@ Precedents: pairing-based PVSS in SCRAPE (Cascudo and David, 2017), and group-el
 ## Open questions for review
 
 - **The sketch's assumptions.** Does S = s·g2 stay hidden given P = s·g1 and all the commitments? Which assumption does the KEM need? How much bias can selective aborts introduce into the DKG?
+- **Packed epochs.** Is the alternation sound as a whole? In particular: weighting new-key contributions inside a pack by Lagrange coefficients instead of summing them; publishing evaluation-form commitments at fixed points; and a packed committee's partials giving e(u, S) for the pack's other buckets.
 - **E2 under receiver selective opening.** The paper requires RIND-SO, which plain ElGamal doesn't have a proof for.
 - **E1 anonymity.** HPKE over X25519 depends on the paper's unproven Conjecture 1.
 - **Real seed redraws.** How many re-draws do block-seed proposers actually get? This sets k1.
@@ -480,7 +528,7 @@ Precedents: pairing-based PVSS in SCRAPE (Cascudo and David, 2017), and group-el
     - sortition with a fixed, not just expected, committee size;
     - a tighter corruption analysis.
 
-    That is a different model from ours, based on accountability. Phase 5's bonds could carry the penalties: a seat's holder is known once it claims, and an invalid dealing is publicly checkable. A silent seat cannot be attributed without something like time-lock puzzles. Fixed-size sortition would also remove the committee-size variance our tails pay for. **Penalties for provably bad dealings are done (Accountability spike results); fixed-size sortition and time-lock puzzles for silence are not.**
+    That is a different model from ours, based on accountability. Phase 5's bonds could carry the penalties: a seat's holder is known once it claims, and an invalid dealing is publicly checkable. A silent seat cannot be attributed without something like time-lock puzzles. Fixed-size sortition would also remove the committee-size variance our tails pay for. **Penalties for provably bad dealings are done (Accountability spike results), but a rational cheater evades them by signing a root that leaves its bad subshare out (Production thresholds and packed epochs). Fixed-size sortition and time-lock puzzles for silence are not done, and the puzzles are what would make the penalties bite.**
   - **[eprint 2026/1101](https://eprint.iacr.org/2026/1101)**, "Tail-Hammer" (David, Lavagnino, Pagnin, Stankovski Wagner). Exact parameters for VRF-selected anonymous committees, about 25% smaller than Blum et al.'s (CCS '23) estimates. It takes the same approach as our exact-tail calculator (`npm run params`), so it does not shrink our numbers further. Its finite-population binomial treatment could replace our N ≫ C Poisson limit, which is conservative.
 
 ## Kept and removed

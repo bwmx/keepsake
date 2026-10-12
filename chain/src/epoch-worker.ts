@@ -4,8 +4,8 @@ import { AlgorandClient, Config, microAlgo } from '@algorandfoundation/algokit-u
 import { nullLogger } from '@algorandfoundation/algokit-utils/types/logging';
 import vrf from '@bwmx/algorand-vrf-utils-ts';
 import { check, seal } from 'keepsake-crypto/dist/src/crypto.js';
-import { decodeMessage, encodeState, seatKeys, stateDigest, type Public } from 'keepsake-crypto/dist/src/ecpss.js';
-import { avmG2, dealingsRoot, findBadDealing } from 'keepsake-crypto/dist/src/fraud.js';
+import { decodeMessage, encodeState, handoverPlan, publicKey, seatKeys, stateDigest, type Public } from 'keepsake-crypto/dist/src/ecpss.js';
+import { findBadDealing } from 'keepsake-crypto/dist/src/fraud.js';
 import { VerifyPool, receiveParallel } from 'keepsake-crypto/dist/src/parallel.js';
 import { decodeG2, type G2Point } from 'keepsake-crypto/dist/src/pvss.js';
 import { SeatVault, type Post } from 'keepsake-crypto/dist/src/vault.js';
@@ -195,13 +195,13 @@ export async function startEpochWorker(cfg: EpochWorkerConfig) {
     if (!view || !mine?.length || !next || !vault || !posted.has(epoch + 1n)) return;
     seats.delete(epoch);
     vaults.delete(epoch);
-    const digest = stateDigest(encodeState(view.pub));
+    const state = encodeState(view.pub), digest = stateDigest(state);
     // Capsules this committee releases: requested, still open, under a bucket it holds. The vault refuses a u whose
     // proof belongs to another policy.
     const round = await reader.lastRound();
     const capsules = (await reader.capsuleRecords()).filter(({ record }) => record.requested && round + 1n < record.expiresRound && view.pub.has(record.bucket));
     const posts = await vault.speak({
-      committee: epoch, pub: new Map([...view.pub].map(([b, poly]) => [b, poly.map(p => p.toBytes())])), buckets: handoverBuckets(params, epoch),
+      committee: epoch, state, buckets: handoverBuckets(params, epoch),
       next: next.map(s => s.value.epk), t,
       claims: new Map(mine.map(m => [m.seat, claimMessage(cfg.pins.appId, epoch, m.nominator, m.ticket, member.addr.publicKey, digest)])),
       capsules: capsules.map(({ id, record }) => ({ id, bucket: record.bucket, u: record.u, proof: record.proof, label: capsuleLabel(cfg.pins.appId, record),
@@ -241,20 +241,20 @@ export async function startEpochWorker(cfg: EpochWorkerConfig) {
     if (view && next) {
       // Fresh seat records: the digests and finalized flags were written after the seats were opened.
       const posted = await reader.seats(c), raw: Map<number, Uint8Array> = await reader.messages(c, posted); // Missing or mismatched: absent.
-      const buckets = handoverBuckets(params, c), held = { live: buckets.live.filter(b => view.pub.has(b)), create: buckets.create };
-      const nextKeys = next.map(s => decodeG2(s.value.epk)), roots = new Map(posted.map(s => [s.seat, s.value.dealingsRoot]));
-      const result = await receiveParallel(cfg.pool, raw, view.pub, c, held, nextKeys, t, [], roots);
-      await reportBadDealings(c, posted, raw, [...held.live, ...held.create], result.valid, nextKeys).catch(report('report'));
+      const buckets = handoverBuckets(params, c), nextKeys = next.map(s => decodeG2(s.value.epk));
+      const result = await receiveParallel(cfg.pool, raw, view.pub, c, buckets, nextKeys, t);
+      await reportBadDealings(c, posted, raw, result.valid, nextKeys).catch(report('report'));
       // The vault for committee c + 1 combines its seats' shares from the dealings everyone chose.
-      const vault = vaults.get(c + 1n), chosen = new Map([...new Set([...result.used.values()].flat())].map(s => [s, raw.get(s)!]));
-      const holders = await vault?.adopt(chosen, result.used, held, next.length, t).catch(e => { report('adopt')(e); closeVault(c + 1n); return undefined; });
+      const vault = vaults.get(c + 1n), chosen = new Map([...new Set([...result.used.values()].flatMap(r => r.seats))].map(s => [s, raw.get(s)!]));
+      const holders = await vault?.adopt(chosen, result.used, next.length, t).catch(e => { report('adopt')(e); closeVault(c + 1n); return undefined; });
       views.set(c + 1n, { pub: result.pub, ...(holders ? { holders } : {}) });
-      // Liveness: how far the valid dealings for each kept bucket exceed t. At zero, one more silent seat loses buckets.
-      const counts = [...held.live, ...held.create].filter(b => !result.lost.includes(b)).map(b => (result.valid.get(b)?.length ?? 0) - t);
-      const margin = counts.length ? Math.min(...counts) : raw.size - t;
+      // Liveness: how far the valid dealings for the tightest kept bucket exceed its need (t, or t + ℓ − 1 to unpack).
+      // At zero, one more silent seat loses buckets.
+      const margin = result.margin ?? raw.size - t;
       event({ received: c.toString(), messages: raw.size.toString(), lost: result.lost.join(','), margin: margin.toString(),
+        mode: handoverPlan(view.pub, buckets, t, next.length).mode, // plain, pack or unpack (ecpss handoverPlan)
         // Public: each bucket's key, so operators can see that all members agree and that keys never change.
-        keys: [...result.pub].map(([b, poly]) => `${b}:${b64url(poly[0]!.toBytes())}`).join(',') });
+        keys: [...result.pub].map(([b, s]) => `${b}:${b64url(publicKey(s).toBytes())}`).join(',') });
     }
     views.delete(c);
     ordered.delete(c);
@@ -272,23 +272,20 @@ export async function startEpochWorker(cfg: EpochWorkerConfig) {
   // A message that matches its signed dealings root but deals some recipient a subshare that fails its checks is proven
   // on chain, and its holder loses its bond. Other faults (undecodable, wrong root, a wrong re-shared value or a bad
   // contribution proof) only get the message dropped. Members race to report; the losers find nothing left to slash.
-  async function reportBadDealings(c: bigint, posted: OrderedSeat[], raw: Map<number, Uint8Array>, kept: bigint[],
-    valid: Map<bigint, number[]>, next: G2Point[]) {
+  async function reportBadDealings(c: bigint, posted: OrderedSeat[], raw: Map<number, Uint8Array>, valid: Map<bigint, number[]>, next: G2Point[]) {
     for (const s of posted) {
       const bytes = raw.get(s.seat);
-      if (!bytes || s.value.holder === member.addr.toString() || kept.every(b => valid.get(b)?.includes(s.seat))) continue;
+      if (!bytes || s.value.holder === member.addr.toString() || [...valid.values()].every(list => list.includes(s.seat))) continue;
       let proof;
       try {
-        const m = decodeMessage(bytes, s.seat, next.length, t);
-        if (!dealingsRoot(m, next.map(avmG2)).equals(Buffer.from(s.value.dealingsRoot))) continue;
-        proof = findBadDealing(m, next, t);
+        proof = findBadDealing(decodeMessage(bytes, s.seat, next.length, t), next, s.value.dealingsRoot);
       } catch {
         continue;
       }
       if (!proof) continue;
       await app.send.reportBadDealing({ coverAppCallInnerTransactionFees: true, maxFee: microAlgo(250_000), args: {
-        committee: c, nominator: s.nominator, ticket: s.ticket, index: BigInt(proof.index), path: proof.path, bucket: proof.bucket,
-        kind: BigInt(proof.kind), k: BigInt(proof.k), epk: proof.epk, commitments: proof.commitments, r1: proof.r1, r2: proof.r2, b: proof.b,
+        committee: c, nominator: s.nominator, ticket: s.ticket, index: BigInt(proof.index), path: proof.path, id: proof.id,
+        kind: BigInt(proof.kind), k: BigInt(proof.k), epk: proof.epk, expected: proof.expected, r1: proof.r1, r2: proof.r2, b: proof.b,
       } }).then(() => event({ reported: c.toString(), dealer: s.seat.toString() }), e => { if (!/Nothing to slash/.test(String(e))) throw e; });
     }
   }

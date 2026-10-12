@@ -1,6 +1,6 @@
 import { availableParallelism } from 'node:os';
 import { Worker } from 'node:worker_threads';
-import { adopt, decodeMessage, type Buckets, type Public } from './ecpss.js';
+import { adopt, choose, decodeMessage, encodeState, type Buckets, type Public } from './ecpss.js';
 import type { G2Point } from './pvss.js';
 
 /**
@@ -10,8 +10,7 @@ import type { G2Point } from './pvss.js';
  */
 export interface Task {
   n: number; t: number; committee: string; epks: Uint8Array[];
-  live: [string, Uint8Array[]][]; create: string[]; messages: [number, Uint8Array][];
-  roots?: [number, Uint8Array][]; // Each seat's signed dealings root (fraud.ts); a message that does not match is dropped.
+  state: Uint8Array; live: string[]; create: string[]; messages: [number, Uint8Array][]; // state: the committee's, encoded
 }
 export type TaskResult = [string, number[]][];
 
@@ -64,22 +63,20 @@ export class VerifyPool {
 
 /**
  * `receive` from raw message bytes, verified on the pool. Undecodable or invalid messages count as absent. Also returns
- * every valid dealer per bucket (the handover's liveness margin is how far each list exceeds t).
+ * every valid dealer per bucket, the recipes (`used`) and the liveness margin (see `choose`).
  */
 export async function receiveParallel(pool: VerifyPool, raw: Map<number, Uint8Array>, pub: Public, committee: bigint, buckets: Buckets,
-  next: G2Point[], t: number, mine: { seat: number; x: bigint }[] = [], roots?: Map<number, Uint8Array>) {
+  next: G2Point[], t: number, mine: { seat: number; x: bigint }[] = []) {
   const seats = [...raw.keys()].sort((a, b) => a - b);
   // One task per thread: every batch repeats about C pairings, so fewer, larger batches are cheaper (measured).
   const per = Math.max(1, Math.ceil(seats.length / pool.size)), k = Math.ceil(seats.length / per);
-  const common = { n: next.length, t, committee: committee.toString(), epks: next.map(p => p.toBytes()),
-    live: buckets.live.filter(b => pub.has(b)).map(b => [b.toString(), pub.get(b)!.map(p => p.toBytes())] as [string, Uint8Array[]]),
-    create: buckets.create.map(String) };
+  const common = { n: next.length, t, committee: committee.toString(), epks: next.map(p => p.toBytes()), state: encodeState(pub),
+    live: buckets.live.map(String), create: buckets.create.map(String) };
   const results = await Promise.all(Array.from({ length: k }, (_, i) =>
-    pool.run({ ...common, messages: seats.slice(i * per, (i + 1) * per).map(s => [s, raw.get(s)!]),
-      ...(roots ? { roots: seats.slice(i * per, (i + 1) * per).filter(s => roots.has(s)).map(s => [s, roots.get(s)!]) } : {}) })));
+    pool.run({ ...common, messages: seats.slice(i * per, (i + 1) * per).map(s => [s, raw.get(s)!]) })));
   const valid = new Map<bigint, number[]>();
   for (const [b, list] of results.flat()) valid.set(BigInt(b), [...(valid.get(BigInt(b)) ?? []), ...list].sort((x, y) => x - y));
-  const chosen = new Set([...valid.values()].flatMap(list => list.slice(0, t)));
-  const messages = new Map([...chosen].map(s => [s, decodeMessage(raw.get(s)!, s, next.length, t, mine.map(m => m.seat))]));
-  return { ...adopt(messages, valid, buckets, t, mine), valid };
+  const chosen = choose(pub, buckets, valid, t, next.length), dealers = new Set([...chosen.used.values()].flatMap(r => r.seats));
+  const messages = new Map([...dealers].map(s => [s, decodeMessage(raw.get(s)!, s, next.length, t, mine.map(m => m.seat))]));
+  return { ...adopt(messages, chosen.used, mine), ...chosen, valid };
 }

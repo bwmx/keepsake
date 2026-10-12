@@ -33,20 +33,21 @@ export function paperBound(f: number, k1: number, k2: number, k3: number): Bound
 /**
  * Exact Poisson tails of the same process: corrupt seats ~ Pois(C·f·(2 − f)) (corrupt nominators, plus honest ones
  * that pick corrupt nominees), honest seats ~ Pois(C·(1 − f)²). Smallest C with a threshold t such that
- * 2^k1·P(corrupt ≥ t) ≤ 2^-k2 (secrecy) and P(honest < t) ≤ 2^-k3 (liveness).
+ * 2^k1·P(corrupt ≥ t) ≤ 2^-k2 (secrecy) and P(honest < t + extra) ≤ 2^-k3 (liveness). With packed epochs
+ * (ecpss handoverPlan) a committee unpacking ℓ buckets needs t + ℓ − 1 valid dealings: pass extra = ℓ − 1.
  */
-export function exactBound(f: number, k1: number, k2: number, k3: number): Bound {
+export function exactBound(f: number, k1: number, k2: number, k3: number, extra = 0): Bound {
   let lo = 4, hi = 64;
-  while (threshold(hi, f, k1, k2, k3) === undefined) hi *= 2;
+  while (threshold(hi, f, k1, k2, k3, extra) === undefined) hi *= 2;
   while (lo < hi) {
     const mid = Math.floor((lo + hi) / 2);
-    if (threshold(mid, f, k1, k2, k3) === undefined) lo = mid + 1;
+    if (threshold(mid, f, k1, k2, k3, extra) === undefined) lo = mid + 1;
     else hi = mid;
   }
-  return { C: lo, t: threshold(lo, f, k1, k2, k3)! };
+  return { C: lo, t: threshold(lo, f, k1, k2, k3, extra)! };
 }
 
-function threshold(C: number, f: number, k1: number, k2: number, k3: number): number | undefined {
+function threshold(C: number, f: number, k1: number, k2: number, k3: number, extra: number): number | undefined {
   const corrupt = C * f * (2 - f), honest = C * (1 - f) ** 2;
   const K = Math.ceil(honest + 30 * Math.sqrt(honest) + 300);
   const logPmf = (lambda: number) => { // log P(Pois(λ) = k) for k = 0..K, from P(0) = e^-λ upwards.
@@ -59,8 +60,8 @@ function threshold(C: number, f: number, k1: number, k2: number, k3: number): nu
   for (let k = K; k >= 0; k--) tail[k] = logAdd(tail[k + 1]!, pc[k]!);
   const t = tail.findIndex(x => k1 * LN2 + x <= -k2 * LN2);
   const ph = logPmf(honest);
-  let below = -Infinity; // log P(honest < t)
-  for (let k = 0; k < t; k++) below = logAdd(below, ph[k]!);
+  let below = -Infinity; // log P(honest < t + extra)
+  for (let k = 0; k < t + extra; k++) below = logAdd(below, ph[k]!);
   return below <= -k3 * LN2 ? t : undefined;
 }
 
@@ -72,4 +73,5 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     console.log(`${`2^${k1}, 2^-${k2} exact`.padEnd(30)}${fs.map(f => show(exactBound(f, k1, k2, k2))).join('')}`);
   }
   console.log(`${'2^64, 2^-128 paper bounds'.padEnd(30)}${fs.map(f => show(paperBound(f, 64, 128, 128))).join('')}`);
+  for (const l of [4, 8]) console.log(`${`2^0, 2^-40 exact, ${l} packed`.padEnd(30)}${fs.map(f => show(exactBound(f, 0, 40, 40, l - 1))).join('')}`);
 }

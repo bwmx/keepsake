@@ -14,14 +14,12 @@ const BATCH: uint64 = 7
 // seats are kept that long, and a withdrawal stays slashable for UNBONDING_EPOCHS, longer than any seat it may hold.
 const REPORT_EPOCHS: uint64 = 2
 const UNBONDING_EPOCHS: uint64 = 4
-// Two pairing checks with the G2 points first (13,000 + 10,000 per 192 bytes of G1 points: 23,000 and 33,000) and a
-// multi-scalar multiplication in G1 (6,500 + 95 per scalar), plus hashing and the budget loop itself.
-const FRAUD_BUDGET: uint64 = 70_000
-const FRAUD_BUDGET_PER_COMMITMENT: uint64 = 100
-// BLS12-381 in the encoding ec_* opcodes take (X || Y, Fp2 as c0 || c1): -g1, g2, and the scalar field's order.
+// Two pairing checks with the G2 points first (13,000 + 10,000 per 192 bytes of G1 points: 23,000 and 33,000), plus
+// the leaf, a Merkle path of up to about 40 levels, and the slash. Independent of t. (57,000 passes at depth 3.)
+const FRAUD_BUDGET: uint64 = 60_000
+// BLS12-381 in the encoding ec_* opcodes take (X || Y, Fp2 as c0 || c1): -g1 and g2.
 const NEG_G1 = Bytes.fromHex('17f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb114d1d6855d545a8aa7d76c8cf2e21f267816aef1db507c96655b9d5caac42364e6f38ba0ecb751bad54dcd6b939c2ca')
 const G2_GEN = Bytes.fromHex('024aa2b2f08f0a91260805272dc51051c6e47ad4fa403b02b4510b647ae3d1770bac0326a805bbefd48056c8c121bdb813e02b6052719f607dacd3a088274f65596bd0d09920b61ab5da61bbdc7f5049334cf11213945d57e5ac7d055d042b7e0ce5d527727d6e118cc9cdc6da2e351aadfd9baa8cbdd3a76d429a695160d12c923ac9cc3baca289e193548608b828010606c4a02ea734cc32acd2b02bc28b99cb3e287e85a763af267492ab572e99ab3f370d275cec1da1aaa9075ff05f79be')
-const ORDER = BigUint(0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001n)
 
 // Anyone may enroll (PAPER_ALIGNMENT_PLAN.md Phase 5). A member's sortition weight is its bond, capped by its online
 // stake. Bond changes count from the next epoch's nominations, after a seed nobody knew when making them.
@@ -285,19 +283,22 @@ export class EpochCommittee extends Contract {
   }
 
   /**
-   * Anyone proves that a posted dealing gave recipient seat k a subshare that fails its checks against the dealing's own
-   * commitments, and the seat's holder loses its bond (half to the reporter). The leaf is
-   * sha256("ecpss/leaf/v1" || bucket || kind || k || epk || sha256(commitments) || r1 || r2 || b), and its path leads
-   * to the root the holder signed when it claimed the seat. The subshare is valid iff e(r1, g2) = e(g1, r2) and
-   * e(g1, b) = e(Σ k^l·A_l, g2)·e(r1, epk). Points use the ec_* encoding; at most 42 commitments fit one AVM value.
+   * Anyone proves that a leaf under the root a holder signed when it claimed its seat is a subshare that fails its own
+   * checks, and the holder loses its bond (half to the reporter). The leaf is
+   * sha256("ecpss/leaf/v2" || id || kind || k || epk || E || r1 || r2 || b), where E is the commitment the dealer says
+   * recipient k's subshare opens to. The subshare is consistent iff e(r1, g2) = e(g1, r2) and e(g1, b) = e(E, g2)·e(r1, epk).
+   * An honest holder signs only consistent leaves, so nothing here needs the dealing's commitments or t: a leaf whose E
+   * or epk does not match the dealing is the holder's own doing, and verifiers reject the dealing off chain anyway.
+   * Points use the ec_* encoding.
    */
-  reportBadDealing(committee: uint64, nominator: uint64, ticket: uint64, index: uint64, path: bytes, bucket: uint64, kind: uint64,
-    k: uint64, epk: bytes<192>, commitments: bytes, r1: bytes<96>, r2: bytes<192>, b: bytes<192>): void {
+  reportBadDealing(committee: uint64, nominator: uint64, ticket: uint64, index: uint64, path: bytes, id: uint64, kind: uint64,
+    k: uint64, epk: bytes<192>, expected: bytes<96>, r1: bytes<96>, r2: bytes<192>, b: bytes<192>): void {
     const seat = clone(this.seats(this.seatKey(committee, nominator, ticket)).value)
     assert(seat.finalized, 'Not posted')
-    assert(kind <= 1 && path.length % 32 === 0, 'Invalid proof')
-    let node = op.sha256(Bytes('ecpss/leaf/v1').concat(op.itob(bucket)).concat(op.extract(op.itob(kind), 7, 1)).concat(op.itob(k))
-      .concat(epk).concat(op.sha256(commitments)).concat(r1).concat(r2).concat(b))
+    assert(kind <= 255 && path.length % 32 === 0, 'Invalid proof')
+    ensureBudget(FRAUD_BUDGET, OpUpFeeSource.GroupCredit)
+    let node = op.sha256(Bytes('ecpss/leaf/v2').concat(op.itob(id)).concat(op.extract(op.itob(kind), 7, 1)).concat(op.itob(k))
+      .concat(epk).concat(expected).concat(r1).concat(r2).concat(b))
     let bits = index
     for (let d: uint64 = 0; d < path.length; d += 32) {
       const sibling = op.extract(path, d, 32)
@@ -305,20 +306,9 @@ export class EpochCommittee extends Contract {
       bits = bits / 2
     }
     assert(node === seat.dealingsRoot, 'Not under the holder\'s root')
-    const t = this.shareThreshold.value
-    assert(commitments.length === t * 96, 'Invalid proof')
-    ensureBudget(FRAUD_BUDGET + FRAUD_BUDGET_PER_COMMITMENT * t, OpUpFeeSource.GroupCredit)
-    // Scalars k^0..k^(t-1) mod the group order, 32 bytes each, for Σ k^l·A_l.
-    let scalars = Bytes()
-    let power: biguint = BigUint(1)
-    for (let l: uint64 = 0; l < t; l++) {
-      scalars = scalars.concat(op.bzero(32).bitwiseOr(Bytes(power)))
-      power = (power * BigUint(k)) % ORDER
-    }
-    const c = op.EllipticCurve.scalarMulMulti(op.Ec.BLS12_381g1, commitments, scalars)
     // G2 points first: pairing checks then cost 10,000 per 192 bytes of G1 points instead of per 96 bytes of G2 points.
     const consistent = op.EllipticCurve.pairingCheck(op.Ec.BLS12_381g2, G2_GEN.concat(r2), r1.concat(NEG_G1))
-    const matches = op.EllipticCurve.pairingCheck(op.Ec.BLS12_381g2, b.concat(G2_GEN).concat(epk), NEG_G1.concat(c).concat(r1))
+    const matches = op.EllipticCurve.pairingCheck(op.Ec.BLS12_381g2, b.concat(G2_GEN).concat(epk), NEG_G1.concat(expected).concat(r1))
     assert(!(consistent && matches), 'Dealing is valid')
     // Slash the holder's whole bond, including any withdrawal still unbonding.
     const holder = this.indexOf(seat.holder)

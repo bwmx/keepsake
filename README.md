@@ -4,9 +4,9 @@
 
 How it works:
 - **Committees.** Each epoch, members win anonymous seats by stake-weighted VRF sortition. Seats are nominated through sealed one-time keys, so nobody knows who holds a seat until it speaks.
-- **Handover.** Each holder speaks once: it re-shares its share of every live key to the next committee, then erases its secrets. Secrets live in short-lived vault processes that exit before anything is posted.
+- **Handover.** Each holder speaks once: it re-shares its share of every live key to the next committee, then erases its secrets. Handovers alternate between packing every key into one dealing per holder and unpacking them again, so an epoch costs about one dealing per holder, not one per key. Secrets live in short-lived vault processes that exit before anything is posted.
 - **Capsules.** A secret is sealed to the key of the time bucket its expiry falls in. When the recipient asks, holders release partial decryptions sealed to the recipient's key, and the recipient decrypts. After the bucket's last handover nobody holds its key.
-- **Accountability.** Holders answer with an escrowed bond. A provably bad dealing, checked on chain with Algorand's BLS12-381 opcodes, costs the holder its bond.
+- **Accountability.** Holders answer with an escrowed bond. A provably bad dealing, checked on chain with Algorand's BLS12-381 opcodes, costs the holder its bond. A careful cheater can avoid being provable, though, so this does not deter yet (see the [plan](PAPER_ALIGNMENT_PLAN.md)).
 
 **Status: unreviewed research code.** It runs on LocalNet and has run small TestNet trials, with committees of up to 60 seats. No cryptographer has reviewed it. Use synthetic secrets only.
 

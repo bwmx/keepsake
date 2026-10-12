@@ -12,17 +12,27 @@ import { bls12_381 as bls } from '@noble/curves/bls12-381.js';
  */
 const { G1, G2 } = bls;
 const { Fr, Fp12 } = bls.fields;
+const check = (ok: boolean, message: string) => { if (!ok) throw new Error(message); };
 export type G1Point = typeof G1.Point.BASE;
 export type G2Point = typeof G2.Point.BASE;
 export type GT = ReturnType<typeof bls.pairing>;
 
 export interface Subshare { r1: G1Point; r2: G2Point; b: G2Point } // r·g1, r·g2, M + r·epk
 export interface Proof { c: bigint; z: bigint }
+/**
+ * A dealing's polynomial has m values v_0..v_(m-1) and seat k's share is Σ_i w_i(k)·v_i, where the weights w(k) come
+ * from its form: powers of k (coefficient form, v_0 the constant term) or Lagrange coefficients at k over the points
+ * −1..−m (evaluation form, v_i the value at −(i+1)), which packs several secrets into one polynomial.
+ */
+export type Form = 'coefficients' | 'evaluations';
 export interface Dealing {
   dealer: number; // The dealer's seat (evaluation point) in the current committee.
-  commitments: G1Point[]; // A_0..A_(t-1): A_0 is the dealer's share commitment, or z·g1 for a new-key contribution.
+  // C_i = v_i·g1. The first values (the heads) are dealt shares, whose commitments are public, or new-key contributions
+  // z·g1; the rest are random.
+  commitments: G1Point[];
   subshares: Subshare[]; // One per next-committee seat 1..n, in seat order.
-  pok?: Proof; // New-key contributions only: knowledge of A_0's discrete log, against rogue-key choices.
+  proofs: Proof[]; // One per new-key contribution head (the last heads): knowledge of z, against rogue-key choices.
+  expected?: G1Point[]; // Dealer side only, never on the wire: each recipient's commitment Σ_i w_i(k)·C_i (fraud.ts).
 }
 
 export const ORDER = Fr.ORDER;
@@ -49,13 +59,40 @@ export function evaluate(coefficients: bigint[], k: bigint): bigint {
   return acc;
 }
 
-/** Lagrange coefficients at 0 for the given seats. */
-export function lagrange(seats: number[]): bigint[] {
+/** Lagrange coefficients at `at` (by default 0, where a bucket's own polynomial keeps its secret) for the given seats. */
+export function lagrange(seats: number[], at = 0n): bigint[] {
   return seats.map(j => {
     let num = 1n, den = 1n;
-    for (const m of seats) if (m !== j) [num, den] = [mod(num * BigInt(m)), mod(den * BigInt(m - j))];
+    for (const m of seats) if (m !== j) [num, den] = [mod(num * (at - BigInt(m))), mod(den * BigInt(j - m))];
     return mod(num * Fr.inv(den));
   });
+}
+
+const bases = new Map<string, bigint[]>();
+/** The weights w(k) of a form with m values (see Form). Cached: every dealing of a handover uses the same ones. */
+export function basis(form: Form, m: number, k: bigint): bigint[] {
+  const key = `${form}:${m}:${k}`;
+  let w = bases.get(key);
+  if (w) return w;
+  if (form === 'coefficients') {
+    w = [1n];
+    while (w.length < m) w.push(mod(w.at(-1)! * k));
+  } else {
+    // L_i(k) = Π_(j≠i) (k + j)/(j − i) over i, j in 1..m: Z(k) / ((k + i)·D_i), with D_i = (−1)^(i−1)·(i−1)!·(m−i)!.
+    const at = Array.from({ length: m }, (_, i) => mod(k + BigInt(i + 1)));
+    const hit = at.indexOf(0n);
+    if (hit >= 0) w = at.map((_, i) => (i === hit ? 1n : 0n));
+    else {
+      const fact = [1n];
+      for (let i = 1; i < m; i++) fact.push(mod(fact[i - 1]! * BigInt(i)));
+      const z = at.reduce((a, b) => mod(a * b), 1n);
+      const inv = Fr.invertBatch(at.map((x, i) => mod(x * (i % 2 ? -1n : 1n) * fact[i]! * fact[m - 1 - i]!)));
+      w = inv.map(x => mod(z * x));
+    }
+  }
+  if (bases.size > 50_000) bases.clear();
+  bases.set(key, w);
+  return w;
 }
 
 /** Schnorr proof of knowledge of x with X = x·g1, bound to a label. */
@@ -71,56 +108,73 @@ export function verifyG1(X: G1Point, proof: Proof, label: Uint8Array): boolean {
 }
 const pokLabel = (context: Uint8Array, dealer: number) => Buffer.concat([context, u32(dealer)]);
 
+/** A value the dealer deals as given: a share it holds (commitment public), or a new-key contribution z·g2 (with z). */
+export interface Head { share: G2Point; commitment: G1Point; z?: bigint; context?: Uint8Array }
+
 /**
- * Deal `share` (with public commitment `commitment`) to the next committee's ephemeral keys, threshold t.
- * For a new-key contribution pass share z·g2, commitment z·g1 and z itself, which adds a proof of knowledge bound to
- * `context` (for example the committee and bucket) and the dealer's seat.
+ * Deals a polynomial of m values in `form` to the next committee's ephemeral keys: the heads first, then random values.
+ * Heads with z (new-key contributions, after any dealt shares) get a proof of knowledge bound to their `context` (for
+ * example the committee and bucket) and the dealer's seat. A plain re-sharing is one head in coefficient form, m = t.
  */
-export function deal(dealer: number, share: G2Point, commitment: G1Point, epks: G2Point[], t: number, z?: bigint,
-  context: Uint8Array = new Uint8Array()): Dealing {
-  const a = [0n, ...Array.from({ length: t - 1 }, () => randomScalar())];
+export function deal(dealer: number, heads: Head[], epks: G2Point[], m: number, form: Form = 'coefficients'): Dealing {
+  const proved = heads.findIndex(h => h.z !== undefined);
+  check(heads.length <= m && (proved < 0 || heads.slice(proved).every(h => h.z !== undefined)), 'Contributions must be the last heads');
+  const a = Array.from({ length: m - heads.length }, () => randomScalar());
+  const expected: G1Point[] = [];
+  const subshares = epks.map((epk, i) => {
+    const w = basis(form, m, BigInt(i + 1)), r = randomScalar();
+    const tail = a.reduce((s, x, l) => mod(s + x * w[heads.length + l]!), 0n);
+    let value = g2(tail), commitment = g1(tail);
+    heads.forEach((h, j) => {
+      value = value.add(w[j] === 1n ? h.share : h.share.multiply(w[j]!)); // Weights at seats are never 0.
+      commitment = commitment.add(h.commitment.multiplyUnsafe(w[j]!));
+    });
+    expected.push(commitment);
+    return { r1: g1(r), r2: g2(r), b: value.add(epk.multiply(r)) };
+  });
   return {
     dealer,
-    commitments: [commitment, ...a.slice(1).map(g1)],
-    subshares: epks.map((epk, i) => {
-      const r = randomScalar();
-      return { r1: g1(r), r2: g2(r), b: share.add(g2(evaluate(a, BigInt(i + 1)))).add(epk.multiply(r)) };
-    }),
-    ...(z === undefined ? {} : { pok: proveG1(z, commitment, pokLabel(context, dealer)) }),
+    commitments: [...heads.map(h => h.commitment), ...a.map(g1)],
+    subshares,
+    proofs: heads.filter(h => h.z !== undefined).map(h => proveG1(h.z!, h.commitment, pokLabel(h.context ?? new Uint8Array(), dealer))),
+    expected,
   };
 }
 
 /**
- * The dealings that pass, keeping their order. Re-sharing passes `prior` (each dealer's current share commitment, which
- * A_0 must equal); new-key contributions instead need a valid proof of knowledge for `context`. All subshares are checked
- * in one random-linear-combination batch, bisected when it fails:
- *   e(Σρ·r1, g2) = e(g1, Σρ·r2)  and  e(g1, Σρ·b) = e(Σ_jl c_jl·A_jl, g2) · Π_k e(W_k, epk_k),
- * with ρ_jk = α_j·β_k (sound with probability about 2^-127), c_jl = α_j·Σ_k β_k·k^l and W_k = Σ_j ρ_jk·r1_jk.
+ * The dealings that pass, keeping their order. Each has m commitments in `form`; its first heads must equal `prior`
+ * (the dealer's share commitments, when re-sharing) and the next ones carry valid proofs of knowledge for `contexts`
+ * (new-key contributions). All subshares are checked in one random-linear-combination batch, bisected when it fails:
+ *   e(Σρ·r1, g2) = e(g1, Σρ·r2)  and  e(g1, Σρ·b) = e(Σ_ji c_ji·C_ji, g2) · Π_k e(W_k, epk_k),
+ * with ρ_jk = α_j·β_k (sound with probability about 2^-127), c_ji = α_j·Σ_k β_k·w_i(k) and W_k = Σ_j ρ_jk·r1_jk.
  */
-export function validDealings(dealings: Dealing[], epks: G2Point[], t: number,
-  o: { prior?: Map<number, G1Point>; context?: Uint8Array } = {}): Dealing[] {
-  const seen = new Set<number>();
+export function validDealings(dealings: Dealing[], epks: G2Point[], m: number,
+  o: { form?: Form; prior?: Map<number, G1Point[]>; contexts?: Uint8Array[] } = {}): Dealing[] {
+  const seen = new Set<number>(), contexts = o.contexts ?? [];
   const shaped = dealings.filter(d => {
-    const ok = !seen.has(d.dealer) && d.commitments.length === t && d.subshares.length === epks.length &&
-      (o.prior ? !!o.prior.get(d.dealer)?.equals(d.commitments[0]!)
-        : !!d.pok && verifyG1(d.commitments[0]!, d.pok, pokLabel(o.context ?? new Uint8Array(), d.dealer)));
+    const prior = o.prior ? o.prior.get(d.dealer) : [];
+    const ok = !seen.has(d.dealer) && !!prior && d.commitments.length === m && d.subshares.length === epks.length &&
+      prior.length + contexts.length <= m && d.proofs.length === contexts.length && prior.every((c, i) => c.equals(d.commitments[i]!)) &&
+      contexts.every((c, i) => verifyG1(d.commitments[prior.length + i]!, d.proofs[i]!, pokLabel(c, d.dealer)));
     seen.add(d.dealer);
     return ok;
   });
-  return bisect(shaped, epks, t);
+  return bisect(shaped, epks, m, o.form ?? 'coefficients');
 }
 
-function bisect(dealings: Dealing[], epks: G2Point[], t: number): Dealing[] {
-  if (!dealings.length || batchOk(dealings, epks, t)) return dealings;
+function bisect(dealings: Dealing[], epks: G2Point[], m: number, form: Form): Dealing[] {
+  if (!dealings.length || batchOk(dealings, epks, m, form)) return dealings;
   if (dealings.length === 1) return [];
   const mid = dealings.length >> 1;
-  return [...bisect(dealings.slice(0, mid), epks, t), ...bisect(dealings.slice(mid), epks, t)];
+  return [...bisect(dealings.slice(0, mid), epks, m, form), ...bisect(dealings.slice(mid), epks, m, form)];
 }
 
-function batchOk(dealings: Dealing[], epks: G2Point[], t: number): boolean {
+/** Whether every subshare of these well-shaped dealings matches its commitments (one batch; see validDealings). */
+export function batchOk(dealings: Dealing[], epks: G2Point[], m: number, form: Form = 'coefficients'): boolean {
   try {
     const alpha = dealings.map(() => randomScalar(128)), beta = epks.map(() => randomScalar(128));
-    const gamma = Array.from({ length: t }, (_, l) => beta.reduce((s, b, k) => mod(s + b * mod(BigInt(k + 1) ** BigInt(l))), 0n));
+    const gamma = Array<bigint>(m).fill(0n);
+    beta.forEach((b, k) => basis(form, m, BigInt(k + 1)).forEach((w, i) => (gamma[i] = mod(gamma[i]! + b * w))));
     const rho = dealings.flatMap((_, j) => beta.map(b => mod(alpha[j]! * b)));
     const all = dealings.flatMap(d => d.subshares);
     const W = epks.map((_, k) => pippenger(G1.Point, dealings.map(d => d.subshares[k]!.r1), dealings.map((_, j) => mod(alpha[j]! * beta[k]!))));
@@ -139,16 +193,22 @@ function batchOk(dealings: Dealing[], epks: G2Point[], t: number): boolean {
 export const aggregate = (dealings: Dealing[], weights: bigint[]): G1Point[] =>
   dealings[0]!.commitments.map((_, l) => pippenger(G1.Point, dealings.map(d => d.commitments[l]!), weights));
 
-/** Seat k's public share commitment from polynomial commitments: Σ_l k^l·A_l. */
-export const seatCommitment = (poly: G1Point[], k: number): G1Point =>
-  pippenger(G1.Point, poly, poly.map((_, l) => mod(BigInt(k) ** BigInt(l))));
+/** Seat k's public share commitment from a polynomial's commitments: Σ_i w_i(k)·C_i. */
+export const seatCommitment = (poly: G1Point[], k: number, form: Form = 'coefficients'): G1Point =>
+  pippenger(G1.Point, poly, basis(form, poly.length, BigInt(k)));
+
+/** Seat k's subshares from these dealings, decrypted with its ephemeral key x. */
+export const openSubshares = (k: number, x: bigint, dealings: Dealing[]) =>
+  dealings.map(d => d.subshares[k - 1]!).map(s => s.b.subtract(s.r2.multiply(x)));
+/** Σ weights_j·points_j in G2. */
+export const weightedG2 = (points: G2Point[], weights: bigint[]): G2Point => pippenger(G2.Point, points, weights);
 
 /**
  * Seat k's new share from the chosen dealings: weights are Lagrange coefficients over the dealers' seats when
  * re-sharing, or all 1 when summing new-key contributions.
  */
 export function combine(k: number, x: bigint, dealings: Dealing[], weights: bigint[]): G2Point {
-  return pippenger(G2.Point, dealings.map(d => d.subshares[k - 1]!).map(s => s.b.subtract(s.r2.multiply(x))), weights);
+  return weightedG2(openSubshares(k, x, dealings), weights);
 }
 
 /** Capsule KEM: key = e(P, g2)^r with u = r·g1, plus a proof of r bound to the capsule's policy label. */
@@ -191,9 +251,9 @@ export function decodePartial(bytes: Uint8Array): Partial {
   return { d, proof: { c, z: decodeG2(bytes.subarray(608)) } };
 }
 
-/** The KEM key from t verified partials of distinct seats. */
-export function combinePartials(parts: { seat: number; d: GT }[]): GT {
-  const weights = lagrange(parts.map(p => p.seat));
+/** The KEM key from enough verified partials of distinct seats, interpolated to the secret's point `at`. */
+export function combinePartials(parts: { seat: number; d: GT }[], at = 0n): GT {
+  const weights = lagrange(parts.map(p => p.seat), at);
   return parts.reduce((acc, p, i) => Fp12.mul(acc, Fp12.pow(p.d, weights[i]!)), Fp12.ONE);
 }
 
@@ -208,11 +268,12 @@ export function decodeProof(bytes: Uint8Array): Proof {
   const big = (b: Uint8Array) => BigInt(`0x${Buffer.from(b).toString('hex')}`);
   return { c: big(bytes.subarray(0, SCALAR)), z: big(bytes.subarray(SCALAR)) };
 }
-export const dealingSize = (n: number, t: number, contribution: boolean) => t * 48 + n * 240 + (contribution ? 2 * SCALAR : 0);
+/** A dealing on the wire: m commitments, n subshares, then its proofs. */
+export const dealingSize = (n: number, m: number, proofs: number) => m * 48 + n * 240 + proofs * 2 * SCALAR;
 
 export function encodeDealing(d: Dealing): Buffer {
   return Buffer.concat([...d.commitments.map(p => p.toBytes()), ...d.subshares.flatMap(s => [s.r1.toBytes(), s.r2.toBytes(), s.b.toBytes()]),
-    ...(d.pok ? [scalarBytes(d.pok.c), scalarBytes(d.pok.z)] : [])]);
+    ...d.proofs.flatMap(p => [scalarBytes(p.c), scalarBytes(p.z)])]);
 }
 
 /**
@@ -220,20 +281,20 @@ export function encodeDealing(d: Dealing): Buffer {
  * With `keep` (seats), only those subshares are decoded and the rest are left out of the sparse array: such a partial
  * dealing serves `aggregate` and `combine` for already-verified dealings, never `validDealings`.
  */
-export function decodeDealing(bytes: Uint8Array, dealer: number, n: number, t: number, contribution: boolean, keep?: number[]): Dealing {
-  if (bytes.length !== dealingSize(n, t, contribution)) throw new Error('Bad dealing length');
+export function decodeDealing(bytes: Uint8Array, dealer: number, n: number, m: number, proofs: number, keep?: number[]): Dealing {
+  if (bytes.length !== dealingSize(n, m, proofs)) throw new Error('Bad dealing length');
   let at = 0;
   const take = (len: number) => bytes.subarray(at, (at += len));
   const p1 = () => decodeG1(take(48)), p2 = () => decodeG2(take(96));
   const scalar = () => { const x = BigInt(`0x${Buffer.from(take(SCALAR)).toString('hex')}`); if (x >= ORDER) throw new Error('Non-canonical scalar'); return x; };
-  const commitments = Array.from({ length: t }, p1);
+  const commitments = Array.from({ length: m }, p1);
   const wanted = keep && new Set(keep);
   const subshares: Subshare[] = [];
   for (let k = 1; k <= n; k++) {
     if (!wanted || wanted.has(k)) subshares[k - 1] = { r1: p1(), r2: p2(), b: p2() };
     else at += 240; // Skipped: no subgroup checks for points this caller never uses.
   }
-  return { dealer, commitments, subshares, ...(contribution ? { pok: { c: scalar(), z: scalar() } } : {}) };
+  return { dealer, commitments, subshares, proofs: Array.from({ length: proofs }, () => ({ c: scalar(), z: scalar() })) };
 }
 
 const nonZero = <P extends { is0(): boolean }>(p: P) => { if (p.is0()) throw new Error('Identity point'); return p; };

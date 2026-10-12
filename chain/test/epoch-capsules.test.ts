@@ -5,7 +5,7 @@ import { microAlgo } from '@algorandfoundation/algokit-utils';
 import { generateEphemeralKey } from 'keepsake-crypto/dist/src/crypto.js';
 import { messageEntries } from 'keepsake-crypto/dist/src/ecpss.js';
 import { VerifyPool } from 'keepsake-crypto/dist/src/parallel.js';
-import { CAPSULE_DEPOSIT, assertLive, attestedState, bucketKey, capsuleLabel, livenessMargin, openCapsule, sealCapsule } from '../src/epoch-capsules.js';
+import { CAPSULE_DEPOSIT, assertLive, attestedState, bucketKey, capsuleLabel, handoverNeeds, livenessMargin, openCapsule, sealCapsule } from '../src/epoch-capsules.js';
 import { windows } from '../src/epochs.js';
 import { algorand, deploy, lastRound, rejects, runUntil, startWorkers, stepAll, type WorkerEvent } from './epoch-env.js';
 
@@ -86,21 +86,24 @@ test('capsules on bucket keys: private release from handover messages; refusals;
     assert.ok(!(await attestedState(env.reader, after, t))?.has(a.bucket));
     const n = (await env.reader.seats(after + 1n)).length;
     for (const bytes of (await env.reader.messages(after, await env.reader.seats(after))).values()) {
-      assert.ok(!messageEntries(bytes, n, t).some(e => e.kind === 0 && e.id === a.bucket), 'nobody re-deals the dropped bucket');
+      assert.ok(!messageEntries(bytes, n, t).some(e => e.kind <= 1 && e.id === a.bucket), 'nobody re-deals the dropped bucket');
     }
 
     // Liveness: members go silent through one handover window, leaving as few seats speaking as possible, but at least
-    // t (exactly t when some set of members holds exactly t seats). Workers report the margin, and senders refuse to
-    // lock while it is below their minimum, until a full handover restores it.
+    // what the handover needs: t, or t + ℓ − 1 if it unpacks (exactly that when some set of members holds that many
+    // seats). Workers report the margin, and senders refuse to lock while it is below their minimum, until a full
+    // handover restores it.
     const quiet = (await epoch()) + 1n, w = windows(env.params, quiet);
     await runUntil(env, workers, async () => (await lastRound()) + 1n >= w.handover[0]);
+    const pub = workers.map(x => x.view(quiet)).find(v => v)!.pub;
+    const need = handoverNeeds(env.params, pub, quiet, t, [(await env.reader.seats(quiet + 1n)).length])[0]!;
     const seatsHeld = workers.map(x => x.view(quiet)?.seats.length ?? 0), total = (set: number[]) => set.reduce((a, i) => a + seatsHeld[i]!, 0);
     let speakers = [...seatsHeld.keys()];
     for (let mask = 1; mask < 1 << seatsHeld.length; mask++) {
       const set = [...seatsHeld.keys()].filter(i => mask & (1 << i));
-      if (total(set) >= t && total(set) < total(speakers)) speakers = set;
+      if (total(set) >= need && total(set) < total(speakers)) speakers = set;
     }
-    const margin = total(speakers) - t;
+    const margin = total(speakers) - need;
     while ((await lastRound()) < w.handover[1]) await stepAll(env, workers, i => speakers.includes(i));
     await runUntil(env, workers, () => events.some(e => e.received === quiet.toString()));
     assert.ok(events.filter(e => e.received === quiet.toString()).every(e => e.margin === margin.toString() && e.lost === ''));
