@@ -100,7 +100,7 @@ Every trial used five throwaway members, all running on one laptop, with the pub
 | 2 | 774022281 | 60 | 20 | 150 rounds (15 / 40) | **Failed.** The node rate-limited (HTTP 429) the reader's parallel box reads, and the worker skipped stages after errors. A cleanup bug then stranded 17.32 Algo in the app | — | 18.7 Algo |
 | 3 | 774029608 | 60 | 20 | 150 rounds (15 / 40) | Every handover held, but only 55, 41, 34 and 50 of 60 messages posted in the window: three confirmed transactions per seat, four seats at a time. A capsule opened 142 s after its request | 5.77 Algo over 4 epochs | 6.68 Algo |
 | 4 | 774037027 | 60 | 20 | 150 rounds (15 / 40) | One atomic group per seat: 60 of 60 messages every handover (margin 40), the last landing 29–31 rounds into the window. About 47 KB per message. A capsule opened 138 s after its request | 5.54 Algo over 4 epochs, about 0.023 Algo per seat per epoch | 6.45 Algo |
-| 5 | 774175840 | 205–215 | 80 | 540 rounds (40 / 220) | Two handovers, every seat posted: 215 messages (margin 135) and 205 (margin 122), about 11 MiB each. Then the trial's capsule step failed on its own timing bug (below). The 40-round nomination window was too short: about 5% of nominations missed it | 15.59 Algo over 3 epochs | — (cleanup in progress) |
+| 5 | 774175840 | 205–215 | 80 | 540 rounds (40 / 220) | Two handovers, every seat posted: 215 messages (margin 135) and 205 (margin 122), about 11 MiB each. Then the trial's capsule step failed on its own timing bug (below). The 40-round nomination window was too short: about 5% of nominations missed it | 15.59 Algo over 3 epochs | 16.71 Algo |
 | 6 | 774192753 | 215–216 | 80 | 600 rounds (60 / 220) | Four handovers, every seat posted (216, 215, 215 and 216 messages; margins 136, 132, 135 and 133). A capsule opened 719 s after its request. No worker errors | 21.02 Algo over 4 epochs, about 0.022 Algo per seat per epoch | 22.17 Algo |
 
 **Run 6 in detail:**
@@ -123,6 +123,6 @@ Notes:
 - **Cleanup after runs 5 and 6 took several passes.** After a network change, the long-running cleanup's pooled connections hung for 30 minutes or more each, and single transaction sends failed with connection resets. A wait now survives a failed status read, and because every cleanup step skips what is already done, re-running `npm run trial -- cleanup` finishes the job.
 - **Where the fees go (run 4).** Nominations take 54% (0.01 Algo each, for the VRF check's opcode budget). Claims cost 0.001 Algo, since the group's pooled budget covers the signature check.
 - **What the net cost is.** Fees, enrollment deposits (there is no exit from the registry) and the app's own minimum balance. Bonds, seat and capsule deposits and account balances all came back.
-- **Total spent.** Runs 1–4 took about 33 TestNet Algo.
+- **Total spent.** Runs 1–4 took about 33 TestNet Algo, and runs 5–6 took 38.9. Each app keeps only its minimum balance and the enrollment deposits (0.83 Algo at five members); everything else came back.
 - **The shared node's rate limit was the bottleneck in runs 2–4,** not the network. With members on their own nodes, there is none to hit.
 - **Not yet seen on TestNet:** members on their own machines and nodes, a real stake distribution, fees under congestion, adversarial members, and the retry of already-built messages after a network error.
