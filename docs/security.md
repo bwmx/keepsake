@@ -1,6 +1,6 @@
 # Security: what Keepsake does and does not protect
 
-**Keepsake is unreviewed research code.** No cryptographer has reviewed its construction, and nobody has audited the implementation. It has run on LocalNet and in small TestNet trials. Use synthetic secrets only.
+**Keepsake is unreviewed research code.** No cryptographer has reviewed its construction, and nobody has audited the implementation. It has run on LocalNet, and on TestNet at production size with every member on one machine. Use synthetic secrets only.
 
 ## What it aims to provide
 
@@ -19,7 +19,7 @@ A capsule is released privately to one recipient, during a window of rounds, and
 
 **The sender and recipient know the plaintext.** Expiry ends future releases, but it does not revoke a release already delivered. A recipient can keep what it decrypted.
 
-**Committees in the tests and demo are small.** The sizes that tolerate a 5% corrupt bond share are C ≈ 130–210 seats ([results.md](results.md#committee-size)), and they assume a bonded population in the thousands for anonymity. Test and demo committees of 5–20 seats tolerate little corruption, and the 60-seat TestNet trial had only five members.
+**Committees in the tests and demo are small.** The sizes that tolerate a 5% corrupt bond share are C ≈ 130–210 seats ([results.md](results.md#committee-size)), and they assume a bonded population in the thousands for anonymity. Test and demo committees of 5–20 seats tolerate little corruption. The 216-seat TestNet trial had the right number of seats, but only five members, all on one machine.
 
 **A seat is corrupt if its nominator or its holder is,** so roughly 2f for a corrupt fraction f. Nominators are public once they post, and they know their seat's keys until they erase them. The paper has the same "double dip" (§1.2).
 

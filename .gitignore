@@ -1,4 +1,4 @@
 .DS_Store
 .claude/
 .env
-chain/.testnet-trial.json
+chain/.testnet-trial*.json

@@ -17,6 +17,7 @@ Keepsake started as a simpler design and was moved, step by step, toward the pap
 | 2026-10-11 | `0166b63` | Fraud proofs and bond slashing for provably bad dealings |
 | 2026-10-12 | `aafe141` | Renamed to Keepsake. Capsule Lab gains wallets, and senders and recipients encrypt and decrypt in the browser |
 | 2026-10-12 | `ef0152c` | Packed epochs, and fraud proofs that work at production thresholds. Finding: the slashing is evadable |
+| 2026-10-13 | — | Public at [github.com/bwmx/keepsake](https://github.com/bwmx/keepsake). A TestNet trial at production size: 216-seat committees, t = 80, four handovers and a capsule round trip |
 
 ## Why the first design was replaced
 
@@ -64,6 +65,7 @@ The stack was fixed at the start: **AlgoKit with Algorand TypeScript compiled by
 - **Public nodes rate-limit.** Unbounded parallel reads got HTTP 429 on TestNet, and a worker that skipped failed stages lost its handover. Stages now count as done only on success.
 - **Posting a seat as three separate transactions was too slow** for a 60-seat committee. One atomic group per seat fixed it.
 - **A cleanup bug stranded 17.32 TestNet Algo** by closing accounts that still owned seats.
+- **At production size, slow reads move deadlines.** Reading the attested state takes minutes, so the trial's capsule missed the opening round it had chosen before the read. The nomination window also has to grow with seats per member: 40 rounds lost about 5% of nominations at 43 seats each.
 - **Fraud proofs did not fit production t.** Recomputing a commitment from t points overflowed the AVM's 4 KB value limit. Leaves now carry the commitment directly.
 - **The slashing turned out to be evadable** (see [security.md](security.md#penalties-do-not-deter-yet)). The accountability work had overstated deterrence.
 

@@ -18,13 +18,14 @@ import { EpochReader, windows, type EpochParams } from '../src/epochs.js';
  * reports round times, handover timings and fees. Then it returns what it can to the funder. Enrollment deposits stay
  * in the app for good (no exit), as do the app's own minimum balance and the creator's global-state deposit.
  *
- * Throwaway keys go to .testnet-trial.json (git-ignored) so `npm run trial -- cleanup` can recover an interrupted run.
+ * Throwaway keys go to .testnet-trial.json (git-ignored, or TRIAL_STATE) so `npm run trial -- cleanup` can recover an
+ * interrupted run.
  * The funder's mnemonic is read from the environment and never printed. Refuses any network but TestNet.
  */
 Config.configure({ logger: nullLogger });
 const ALGOD = { server: process.env.ALGOD_SERVER ?? 'https://testnet-api.algonode.cloud', token: process.env.ALGOD_TOKEN ?? '' };
 const INDEXER = { server: process.env.INDEXER_SERVER ?? 'https://testnet-idx.algonode.cloud', token: '' };
-const STATE = new URL('../../.testnet-trial.json', import.meta.url);
+const STATE = process.env.TRIAL_STATE ?? new URL('../../.testnet-trial.json', import.meta.url); // TRIAL_STATE: another run's file.
 // Sizes (environment overrides): members, tickets (each wins, so seats per committee), threshold, epoch and window rounds,
 // bucket lead in epochs, and Algos bonded and funded per member.
 const num = (name: string, fallback: number) => Number(process.env[name] ?? fallback);
@@ -184,11 +185,14 @@ try {
   const deadline = (G + 6n) * E;
   let locked: { id: bigint; open: bigint; expires: bigint; payload: ReturnType<typeof sealCapsule>['payload'] } | undefined;
   while (!locked) {
-    const round = await lastRound(), open = round + 15n, expires = open + 2n * E, bucket = expires / params.bucketRounds;
+    const round = await lastRound(), bucket = (round + 15n + 2n * E) / params.bucketRounds;
     const key = await bucketKey(reader, bucket, t, (await epoch()) - 1n);
     if (!key && round > deadline) throw new Error(`No bucket key attested by round ${deadline}`);
     if (!key) { await sleep(30_000); continue; }
     await assertLive(reader, round, t, 1);
+    // Reading the attested state takes many rounds at full size, so the window starts from the round after it.
+    const open = (await lastRound()) + 15n, expires = open + 2n * E;
+    if (expires / params.bucketRounds !== bucket) continue; // Crossed into the next bucket meanwhile: look up its key.
     const label = capsuleLabel(app.appId, { sender: sender.addr.toString(), recipient: recipient.addr.toString(), openRound: open, expiresRound: expires });
     const sealed = sealCapsule(key, label, Buffer.from('a synthetic TestNet capsule'));
     const id = (await app.send.registerCapsule({ sender, args: { recipient: recipient.addr.toString(), openRound: open, expiresRound: expires,

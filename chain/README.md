@@ -95,7 +95,7 @@ A worker that starts after genesis, or restarts with nothing in memory, joins fr
 | `TRIAL_LEAD_EPOCHS` | How far ahead buckets are created |
 | `TRIAL_BOND`, `TRIAL_FUND` | Each member's bond and funding |
 
-The keys of an interrupted run are kept in the git-ignored `.testnet-trial.json`, and `npm run trial -- cleanup` recovers the funds. Cleanup closes an account only once none of its seats remain.
+The keys of an interrupted run are kept in the git-ignored `.testnet-trial.json`, and `npm run trial -- cleanup` recovers the funds. `TRIAL_STATE` points either command at another state file, so an old run can be cleaned up while a new one runs. Cleanup closes an account only once none of its seats remain.
 
 ## Tests
 

@@ -4,7 +4,9 @@
 
 You lock a message for one recipient and a window of rounds. During the window the recipient can ask for it and decrypt it, and nobody else can. Soon after the window closes, the key that could open it no longer exists anywhere.
 
-> **Status: unreviewed research code.** It runs on LocalNet and has run small TestNet trials, with committees of up to 60 seats. No cryptographer has reviewed it. Use synthetic secrets only. See [docs/security.md](docs/security.md).
+For the story and the results, read the **[write-up](docs/writeup.md)**.
+
+> **Status: unreviewed research code.** It runs on LocalNet and has run on TestNet at production size (216-seat committees), with every member on one machine. No cryptographer has reviewed it. Use synthetic secrets only. See [docs/security.md](docs/security.md).
 
 ## How it works
 
@@ -38,11 +40,11 @@ The full walkthrough is in [docs/design.md](docs/design.md).
 
 What has been shown:
 - **LocalNet tests** (see [chain/README.md](chain/README.md#tests)): every bucket survives many handovers with members going offline, crashing and rejoining, and with a cheater among them. Seats track bonds, capsules open only for the right wallet inside their window, and expired buckets are held by nobody.
-- **TestNet trials.** 60-seat committees posted 60 of 60 handover messages each epoch, capsules opened about 140 s after their request, and it cost about 0.023 Algo per seat per epoch ([docs/results.md](docs/results.md#testnet-trials)).
+- **TestNet at production size.** Committees of 216 seats with t = 80 ran four handovers with every seat posting, and a capsule opened 12 minutes after its request, for about 0.022 Algo of fees per seat per epoch ([docs/results.md](docs/results.md#testnet-trials)).
 - **Capsule Lab in headless Chrome** (`npm run browser-check`): the whole flow, with a check that the plaintext never reaches the server.
 
 What has not been shown:
-- committees of a secure size (about 210 seats at a 5% corrupt share), and a large bonded population;
+- a large, independent bonded population: every trial ran five members, all on one machine;
 - members on their own nodes and hosts;
 - penalties that actually deter (a careful cheater evades the fraud proofs);
 - a cryptographer's review.
@@ -69,6 +71,7 @@ Tests and the demo create throwaway LocalNet accounts, so you need no wallet or 
 | --- | --- |
 | [`chain/`](chain/README.md) | The `EpochCommittee` contract, member worker, capsule client, LocalNet tests, Capsule Lab and the TestNet trial |
 | [`crypto/`](crypto/README.md) | Off-chain cryptography: re-sharing, bucket keys, the capsule encryption, fraud proofs, the verification thread pool and vault processes |
+| [`docs/writeup.md`](docs/writeup.md) | The write-up: what was built, what was learned, results and limits |
 | [`docs/design.md`](docs/design.md) | How it works, step by step, and how it maps to the paper |
 | [`docs/security.md`](docs/security.md) | What is and is not protected, and open questions for review |
 | [`docs/results.md`](docs/results.md) | Committee sizes, costs, benchmarks and TestNet trials |
