@@ -37,7 +37,8 @@ const algod = algorand.client.algod;
 const log = (s: string) => console.log(`[${new Date().toISOString().slice(11, 19)}] ${s}`);
 const lastRound = async () => (await algod.status().do()).lastRound;
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
-async function untilRound(round: bigint) { while ((await lastRound()) < round) await sleep(2_000); }
+// Waits can last hours; a failed status read (a network blip) just means another poll.
+async function untilRound(round: bigint) { while ((await lastRound().catch(() => 0n)) < round) await sleep(2_000); }
 
 interface State {
   appId?: string;
